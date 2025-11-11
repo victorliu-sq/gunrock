@@ -96,7 +96,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_VERBOSE_MAKEFILE OFF)
 
 ############ ADD LIBRARY: ESSENTIALS (HEADER-ONLY) ############
-add_library(essentials INTERFACE)
+add_library(essentials INTERFACE
+        include/gunrock/cuda/device_properties.hxx)
 
 ####################################################
 ############### SET TARGET PROPERTIES ##############
