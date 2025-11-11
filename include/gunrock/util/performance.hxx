@@ -65,8 +65,11 @@ void get_gpu_info(nlohmann::json* jsn) {
       std::to_string(gunrock::gcuda::properties::sm_major(device_properties));
   gpuinfo["minor"] =
       std::to_string(gunrock::gcuda::properties::sm_minor(device_properties));
-  gpuinfo["clock_rate"] =
-      std::to_string(gunrock::gcuda::properties::clock_rate(device_properties));
+ // gpuinfo["clock_rate"] =
+   //   std::to_string(gunrock::gcuda::properties::clock_rate(device_properties));
+
+// CUDA 13.0 safe: our clock_rate() takes no args and returns an unsigned value.
+gpuinfo["clock_rate"] = std::to_string(gunrock::gcuda::properties::clock_rate());
   gpuinfo["multi_processor_count"] = std::to_string(
       gunrock::gcuda::properties::multi_processor_count(device_properties));
   gpuinfo["driver_version"] =
