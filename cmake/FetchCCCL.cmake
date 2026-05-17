@@ -1,21 +1,7 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
-
-message(STATUS "Cloning External Project: Thrust")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-    cccl
-    GIT_REPOSITORY https://github.com/NVIDIA/cccl.git
-    GIT_TAG        main
-)
-
-FetchContent_GetProperties(cccl)
-if(NOT cccl_POPULATED)
-  FetchContent_MakeAvailable(
-    cccl
-  )
+set(CCCL_SOURCE_DIR "${PROJECT_DEPS_DIR}/cccl-src")
+if(NOT EXISTS "${CCCL_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing CCCL source directory: ${CCCL_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
-set(CCCL_INCLUDE_DIR "${cccl_SOURCE_DIR}")
+
+message(STATUS "Using External Project: Thrust at ${CCCL_SOURCE_DIR}")
+set(CCCL_INCLUDE_DIR "${CCCL_SOURCE_DIR}")

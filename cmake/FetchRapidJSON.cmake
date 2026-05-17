@@ -1,21 +1,7 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
-
-message(STATUS "Cloning External Project: RapidJSON")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-  rapidjson
-    GIT_REPOSITORY https://github.com/Tencent/rapidjson
-    GIT_TAG        master
-)
-
-FetchContent_GetProperties(rapidjson)
-if(NOT rapidjson_POPULATED)
-  FetchContent_MakeAvailable(
-    rapidjson
-  )
+set(RAPIDJSON_SOURCE_DIR "${PROJECT_DEPS_DIR}/rapidjson-src")
+if(NOT EXISTS "${RAPIDJSON_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing RapidJSON source directory: ${RAPIDJSON_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
-set(RAPIDJSON_INCLUDE_DIR "${rapidjson_SOURCE_DIR}/include")
+
+message(STATUS "Using External Project: RapidJSON at ${RAPIDJSON_SOURCE_DIR}")
+set(RAPIDJSON_INCLUDE_DIR "${RAPIDJSON_SOURCE_DIR}/include")

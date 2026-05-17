@@ -1,21 +1,7 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
-
-message(STATUS "Cloning External Project: ModernGPU")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-    moderngpu
-    GIT_REPOSITORY https://github.com/victorliu-sq/moderngpu
-    GIT_TAG        master
-)
-
-FetchContent_GetProperties(moderngpu)
-if(NOT moderngpu_POPULATED)
-  FetchContent_Populate(
-    moderngpu
-  )
+set(MODERNGPU_SOURCE_DIR "${PROJECT_DEPS_DIR}/moderngpu-src")
+if(NOT EXISTS "${MODERNGPU_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing ModernGPU source directory: ${MODERNGPU_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
-set(MODERNGPU_INCLUDE_DIR "${moderngpu_SOURCE_DIR}/src")
+
+message(STATUS "Using External Project: ModernGPU at ${MODERNGPU_SOURCE_DIR}")
+set(MODERNGPU_INCLUDE_DIR "${MODERNGPU_SOURCE_DIR}/src")

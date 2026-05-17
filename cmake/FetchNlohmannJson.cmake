@@ -1,21 +1,7 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
-
-message(STATUS "Cloning External Project: NLohmannJson")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-  json
-    GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG        develop
-)
-
-FetchContent_GetProperties(json)
-if(NOT json_POPULATED)
-  FetchContent_MakeAvailable(
-    json
-  )
+set(NHLOMANN_JSON_SOURCE_DIR "${PROJECT_DEPS_DIR}/json-src")
+if(NOT EXISTS "${NHLOMANN_JSON_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing nlohmann_json source directory: ${NHLOMANN_JSON_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
-set(NHLOMANN_JSON_INCLUDE_DIR "${json_SOURCE_DIR}/include")
+
+message(STATUS "Using External Project: NLohmannJson at ${NHLOMANN_JSON_SOURCE_DIR}")
+set(NHLOMANN_JSON_INCLUDE_DIR "${NHLOMANN_JSON_SOURCE_DIR}/include")

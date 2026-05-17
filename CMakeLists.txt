@@ -71,7 +71,44 @@ else()
 endif()
 
 # begin /* Dependencies directory */
-set(PROJECT_DEPS_DIR externals)
+if (NOT DEFINED PROJECT_DEPS_DIR)
+    set(PROJECT_DEPS_DIR "${PROJECT_SOURCE_DIR}/../../build_support/deps/gunrock")
+endif ()
+get_filename_component(PROJECT_DEPS_DIR "${PROJECT_DEPS_DIR}" ABSOLUTE BASE_DIR "${PROJECT_BINARY_DIR}")
+set(PROJECT_DEPS_BUILD_DIR "${PROJECT_DEPS_DIR}")
+set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
+    "Do not contact remotes to update already-populated Gunrock dependencies" FORCE)
+message(STATUS "Gunrock dependency source directory: ${PROJECT_DEPS_DIR}")
+message(STATUS "Gunrock dependency build directory: ${PROJECT_DEPS_BUILD_DIR}")
+
+set(GUNROCK_REQUIRED_DEPS
+    cccl-src
+    cccl-build
+    cccl-subbuild
+    moderngpu-src
+    moderngpu-build
+    moderngpu-subbuild
+    cxxopts-src
+    cxxopts-build
+    cxxopts-subbuild
+    json-src
+    json-build
+    json-subbuild
+    cmake_modules-src
+    cmake_modules-build
+    cmake_modules-subbuild
+    googletest-src
+    googletest-build
+    googletest-subbuild
+)
+
+foreach(GUNROCK_DEP IN LISTS GUNROCK_REQUIRED_DEPS)
+    if(NOT EXISTS "${PROJECT_DEPS_DIR}/${GUNROCK_DEP}")
+        message(FATAL_ERROR
+            "Missing Gunrock dependency directory: ${PROJECT_DEPS_DIR}/${GUNROCK_DEP}\n"
+            "Run ./build_support/gunrock/install.sh before configuring Gunrock.")
+    endif()
+endforeach()
 # end /* Dependencies directory */
 
 # begin /* Include cmake modules */
@@ -121,7 +158,7 @@ set_target_properties(essentials
 )
 
 # Add GIT SHA-1 definition
-list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/externals/cmake_modules-src/")
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_DEPS_DIR}/cmake_modules-src/")
 include(GetGitRevisionDescription)
 get_git_head_revision(GIT_REFSPEC GIT_SHA1)
 

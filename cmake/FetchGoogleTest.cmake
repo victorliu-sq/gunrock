@@ -1,22 +1,15 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
+set(GOOGLETEST_SOURCE_DIR "${PROJECT_DEPS_DIR}/googletest-src")
+set(GOOGLETEST_BUILD_DIR "${PROJECT_DEPS_DIR}/googletest-build")
 
-message(STATUS "Cloning External Project: GoogleTests")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG        v1.15.0
-)
-
-# For Windows: Prevent overriding the parent project's compiler/linker settings
-if (MSVC)
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+if(NOT EXISTS "${GOOGLETEST_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing GoogleTest source directory: ${GOOGLETEST_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
 
-FetchContent_MakeAvailable(googletest)
-add_library(gtest::main ALIAS gtest_main)
+message(STATUS "Using External Project: GoogleTests at ${GOOGLETEST_SOURCE_DIR}")
+if(NOT TARGET gtest_main)
+  add_subdirectory("${GOOGLETEST_SOURCE_DIR}" "${GOOGLETEST_BUILD_DIR}" EXCLUDE_FROM_ALL)
+endif()
 
+if(TARGET gtest_main AND NOT TARGET gtest::main)
+  add_library(gtest::main ALIAS gtest_main)
+endif()

@@ -1,21 +1,7 @@
-include(FetchContent)
-set(FETCHCONTENT_QUIET ON)
-
-message(STATUS "Cloning External Project: CXXOPTS")
-get_filename_component(FC_BASE "${PROJECT_SOURCE_DIR}/externals"
-                REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
-set(FETCHCONTENT_BASE_DIR ${FC_BASE})
-
-FetchContent_Declare(
-  cxxopts
-    GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
-    GIT_TAG        v3.0.0
-)
-
-FetchContent_GetProperties(cxxopts)
-if(NOT cxxopts_POPULATED)
-  FetchContent_MakeAvailable(
-    cxxopts
-  )
+set(CXXOPTS_SOURCE_DIR "${PROJECT_DEPS_DIR}/cxxopts-src")
+if(NOT EXISTS "${CXXOPTS_SOURCE_DIR}")
+  message(FATAL_ERROR "Missing CXXOPTS source directory: ${CXXOPTS_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
 endif()
-set(CXXOPTS_INCLUDE_DIR "${cxxopts_SOURCE_DIR}/include")
+
+message(STATUS "Using External Project: CXXOPTS at ${CXXOPTS_SOURCE_DIR}")
+set(CXXOPTS_INCLUDE_DIR "${CXXOPTS_SOURCE_DIR}/include")
