@@ -51,6 +51,10 @@ project(essentials
   HOMEPAGE_URL "https://github.com/gunrock/gunrock"
 )
 
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/lib") # output directory of static libraries
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin") # output directory of shared libraries
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin") # output directory of executables
+
 ####################################################
 ############### SET SM ARCHITECTURE ################
 ####################################################
@@ -117,7 +121,7 @@ set_target_properties(essentials
 )
 
 # Add GIT SHA-1 definition
-list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/externals/cmake_modules-src/")
+list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/externals/cmake_modules-src/")
 include(GetGitRevisionDescription)
 get_git_head_revision(GIT_REFSPEC GIT_SHA1)
 
