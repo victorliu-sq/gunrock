@@ -1,6 +1,6 @@
 set(CCCL_SOURCE_DIR "${PROJECT_DEPS_DIR}/cccl-src")
 if(NOT EXISTS "${CCCL_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing CCCL source directory: ${CCCL_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing CCCL source directory: ${CCCL_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: Thrust at ${CCCL_SOURCE_DIR}")

@@ -1,6 +1,6 @@
 set(CMAKE_MODULES_SOURCE_DIR "${PROJECT_DEPS_DIR}/cmake_modules-src")
 if(NOT EXISTS "${CMAKE_MODULES_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing CMake Modules source directory: ${CMAKE_MODULES_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing CMake Modules source directory: ${CMAKE_MODULES_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: CMake Modules at ${CMAKE_MODULES_SOURCE_DIR}")

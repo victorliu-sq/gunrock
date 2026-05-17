@@ -1,6 +1,6 @@
 set(CXXOPTS_SOURCE_DIR "${PROJECT_DEPS_DIR}/cxxopts-src")
 if(NOT EXISTS "${CXXOPTS_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing CXXOPTS source directory: ${CXXOPTS_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing CXXOPTS source directory: ${CXXOPTS_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: CXXOPTS at ${CXXOPTS_SOURCE_DIR}")

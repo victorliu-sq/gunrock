@@ -2,7 +2,7 @@ set(GOOGLETEST_SOURCE_DIR "${PROJECT_DEPS_DIR}/googletest-src")
 set(GOOGLETEST_BUILD_DIR "${PROJECT_DEPS_DIR}/googletest-build")
 
 if(NOT EXISTS "${GOOGLETEST_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing GoogleTest source directory: ${GOOGLETEST_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing GoogleTest source directory: ${GOOGLETEST_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: GoogleTests at ${GOOGLETEST_SOURCE_DIR}")

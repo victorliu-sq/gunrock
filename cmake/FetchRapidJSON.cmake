@@ -1,6 +1,6 @@
 set(RAPIDJSON_SOURCE_DIR "${PROJECT_DEPS_DIR}/rapidjson-src")
 if(NOT EXISTS "${RAPIDJSON_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing RapidJSON source directory: ${RAPIDJSON_SOURCE_DIR}. Run ./build_support/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing RapidJSON source directory: ${RAPIDJSON_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: RapidJSON at ${RAPIDJSON_SOURCE_DIR}")
