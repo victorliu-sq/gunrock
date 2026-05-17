@@ -80,35 +80,6 @@ set(FETCHCONTENT_UPDATES_DISCONNECTED ON CACHE BOOL
     "Do not contact remotes to update already-populated Gunrock dependencies" FORCE)
 message(STATUS "Gunrock dependency source directory: ${PROJECT_DEPS_DIR}")
 message(STATUS "Gunrock dependency build directory: ${PROJECT_DEPS_BUILD_DIR}")
-
-set(GUNROCK_REQUIRED_DEPS
-    cccl-src
-    cccl-build
-    cccl-subbuild
-    moderngpu-src
-    moderngpu-build
-    moderngpu-subbuild
-    cxxopts-src
-    cxxopts-build
-    cxxopts-subbuild
-    json-src
-    json-build
-    json-subbuild
-    cmake_modules-src
-    cmake_modules-build
-    cmake_modules-subbuild
-    googletest-src
-    googletest-build
-    googletest-subbuild
-)
-
-foreach(GUNROCK_DEP IN LISTS GUNROCK_REQUIRED_DEPS)
-    if(NOT EXISTS "${PROJECT_DEPS_DIR}/${GUNROCK_DEP}")
-        message(FATAL_ERROR
-            "Missing Gunrock dependency directory: ${PROJECT_DEPS_DIR}/${GUNROCK_DEP}\n"
-            "Run ./build_support/gunrock/install.sh before configuring Gunrock.")
-    endif()
-endforeach()
 # end /* Dependencies directory */
 
 # begin /* Include cmake modules */
