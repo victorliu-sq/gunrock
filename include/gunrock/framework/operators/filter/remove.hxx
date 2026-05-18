@@ -2,6 +2,7 @@
 
 #include <gunrock/framework/operators/configs.hxx>
 #include <thrust/remove.h>
+#include <thrust/distance.h>
 
 namespace gunrock {
 namespace operators {

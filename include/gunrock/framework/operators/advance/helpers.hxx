@@ -14,6 +14,7 @@
 #include <gunrock/cuda/context.hxx>
 #include <thrust/transform_scan.h>
 #include <thrust/transform_reduce.h>
+#include <thrust/distance.h>
 
 namespace gunrock {
 namespace operators {

@@ -12,6 +12,7 @@
 
 #include <gunrock/framework/operators/configs.hxx>
 #include <thrust/unique.h>
+#include <thrust/distance.h>
 
 namespace gunrock {
 namespace operators {

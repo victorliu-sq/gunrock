@@ -16,6 +16,7 @@
 // Thrust includes (scan, reduce)
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/distance.h>
 
 namespace gunrock {
 namespace spgemm {
