@@ -17,6 +17,7 @@
 #include <gunrock/framework/benchmark.hxx>
 
 #include <thrust/transform_scan.h>
+#include <thrust/distance.h>
 #include <thrust/iterator/discard_iterator.h>
 
 #include <cub/block/block_load.cuh>
