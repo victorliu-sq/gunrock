@@ -72,7 +72,7 @@ endif()
 
 # begin /* Dependencies directory */
 if (NOT DEFINED PROJECT_DEPS_DIR)
-    set(PROJECT_DEPS_DIR "${PROJECT_SOURCE_DIR}/../../deps/_gunrock")
+    set(PROJECT_DEPS_DIR "${PROJECT_SOURCE_DIR}/../../deps/gunrock")
 endif ()
 get_filename_component(PROJECT_DEPS_DIR "${PROJECT_DEPS_DIR}" ABSOLUTE BASE_DIR "${PROJECT_BINARY_DIR}")
 set(PROJECT_DEPS_BUILD_DIR "${PROJECT_DEPS_DIR}")

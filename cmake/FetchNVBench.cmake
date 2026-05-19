@@ -2,7 +2,7 @@ set(NVBENCH_SOURCE_DIR "${PROJECT_DEPS_DIR}/nvbench-src")
 set(NVBENCH_BUILD_DIR "${PROJECT_DEPS_DIR}/nvbench-build")
 
 if(NOT EXISTS "${NVBENCH_SOURCE_DIR}")
-  message(FATAL_ERROR "Missing NVBench source directory: ${NVBENCH_SOURCE_DIR}. Run ./deps/scripts/gunrock/install.sh first.")
+  message(FATAL_ERROR "Missing NVBench source directory: ${NVBENCH_SOURCE_DIR}. Run ./deps/_scripts/gunrock/install.sh first.")
 endif()
 
 message(STATUS "Using External Project: NVBench at ${NVBENCH_SOURCE_DIR}")
