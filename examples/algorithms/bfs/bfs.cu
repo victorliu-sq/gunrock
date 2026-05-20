@@ -3,11 +3,37 @@
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/framework/benchmark.hxx>
+#include <limits>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform_reduce.h>
 
 #include "bfs_cpu.hxx"  // Reference implementation
 
 using namespace gunrock;
 using namespace memory;
+
+template <typename csr_t, typename vertex_t, typename edge_t>
+size_t count_processed_edges(csr_t& csr,
+                             thrust::device_vector<vertex_t>& distances) {
+  auto row_offsets = thrust::raw_pointer_cast(csr.row_offsets.data());
+  auto distance_values = thrust::raw_pointer_cast(distances.data());
+  auto begin = thrust::make_counting_iterator<vertex_t>(0);
+  auto end = thrust::make_counting_iterator<vertex_t>(
+      static_cast<vertex_t>(distances.size()));
+
+  return thrust::transform_reduce(
+      thrust::device,
+      begin,
+      end,
+      [row_offsets, distance_values] __device__(vertex_t v) -> size_t {
+        if (distance_values[v] == std::numeric_limits<vertex_t>::max()) {
+          return 0;
+        }
+        return static_cast<size_t>(row_offsets[v + 1] - row_offsets[v]);
+      },
+      size_t{0},
+      thrust::plus<size_t>());
+}
 
 void test_bfs(int num_arguments, char** argument_array) {
   // --
@@ -103,6 +129,13 @@ void test_bfs(int num_arguments, char** argument_array) {
   print::head(distances, 40, "GPU distances");
   std::cout << "GPU Elapsed Time : " << run_times[n_runs - 1] << " (ms)"
             << std::endl;
+  auto edges_processed =
+      count_processed_edges<csr_t, vertex_t, edge_t>(csr, distances);
+  auto runtime_s = static_cast<double>(run_times[n_runs - 1]) / 1000.0;
+  std::cout << "Average runtime: " << runtime_s << std::endl;
+  std::cout << "Number of Processed Edges: " << edges_processed << std::endl;
+  std::cout << "Processed Edges per Second: "
+            << static_cast<double>(edges_processed) / runtime_s << std::endl;
 
   // --
   // CPU Run
