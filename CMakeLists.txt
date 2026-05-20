@@ -64,11 +64,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}/bin") # output directo
 ## CUDA_ARCHITECTURES property from the project.
 ## see cmake's get_target_properties()
 if(NOT CMAKE_CUDA_ARCHITECTURES)
-  set(CMAKE_CUDA_ARCHITECTURES 75)
-  message(STATUS "Using default GPU Architecture: ${CMAKE_CUDA_ARCHITECTURES}")
-else()
-  message(STATUS "GPU Architecture (-DCMAKE_CUDA_ARCHITECTURES): ${CMAKE_CUDA_ARCHITECTURES}")
+  message(FATAL_ERROR "Gunrock requires CMAKE_CUDA_ARCHITECTURES to be set by the top-level project")
 endif()
+message(STATUS "GPU Architecture (-DCMAKE_CUDA_ARCHITECTURES): ${CMAKE_CUDA_ARCHITECTURES}")
 
 # begin /* Dependencies directory */
 if (NOT DEFINED PROJECT_DEPS_DIR)
