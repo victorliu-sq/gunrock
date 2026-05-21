@@ -1,9 +1,36 @@
 #include <gunrock/algorithms/bc.hxx>
+#include <gunrock/algorithms/bfs.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <limits>
+#include <thrust/iterator/counting_iterator.h>
+#include <thrust/transform_reduce.h>
 
 using namespace gunrock;
 using namespace memory;
+
+template <typename csr_t, typename vertex_t, typename edge_t>
+size_t count_reached_vertex_edges(csr_t& csr,
+                                  thrust::device_vector<vertex_t>& distances) {
+  auto row_offsets = thrust::raw_pointer_cast(csr.row_offsets.data());
+  auto distance_values = thrust::raw_pointer_cast(distances.data());
+  auto begin = thrust::make_counting_iterator<vertex_t>(0);
+  auto end = thrust::make_counting_iterator<vertex_t>(
+      static_cast<vertex_t>(distances.size()));
+
+  return thrust::transform_reduce(
+      thrust::device,
+      begin,
+      end,
+      [row_offsets, distance_values] __device__(vertex_t v) -> size_t {
+        if (distance_values[v] == std::numeric_limits<vertex_t>::max()) {
+          return 0;
+        }
+        return static_cast<size_t>(row_offsets[v + 1] - row_offsets[v]);
+      },
+      size_t{0},
+      thrust::plus<size_t>());
+}
 
 void test_bc(int num_arguments, char** argument_array) {
   // --
@@ -12,6 +39,8 @@ void test_bc(int num_arguments, char** argument_array) {
   using vertex_t = int;
   using edge_t = int;
   using weight_t = float;
+  using csr_t =
+      format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
 
   // --
   // IO
@@ -22,7 +51,7 @@ void test_bc(int num_arguments, char** argument_array) {
   io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
   auto [properties, coo] = mm.load(params.filename);
 
-  format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t> csr;
+  csr_t csr;
 
   if (params.binary) {
     csr.read_binary(params.filename);
@@ -84,6 +113,17 @@ void test_bc(int num_arguments, char** argument_array) {
   print::head(bc_values, 40, "GPU bc values");
   std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]
             << " (ms)" << std::endl;
+  thrust::device_vector<vertex_t> distances(n_vertices);
+  thrust::device_vector<vertex_t> predecessors(n_vertices);
+  auto source = source_vect.back();
+  gunrock::bfs::run(G, source, distances.data().get(), predecessors.data().get());
+  auto edges_processed =
+      2 * count_reached_vertex_edges<csr_t, vertex_t, edge_t>(csr, distances);
+  auto runtime_s = static_cast<double>(run_times[params.num_runs - 1]) / 1000.0;
+  std::cout << "Average runtime: " << runtime_s << std::endl;
+  std::cout << "Number of Processed Edges: " << edges_processed << std::endl;
+  std::cout << "Processed Edges per Second: "
+            << static_cast<double>(edges_processed) / runtime_s << std::endl;
 }
 
 int main(int argc, char** argv) {
