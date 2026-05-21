@@ -10,38 +10,31 @@ using namespace gunrock;
 using namespace memory;
 
 template <typename csr_t, typename vertex_t, typename edge_t>
-size_t count_bc_level_edges(csr_t& csr,
-                            thrust::device_vector<vertex_t>& distances) {
+size_t count_reached_vertex_edges(csr_t& csr,
+                                  thrust::device_vector<vertex_t>& distances,
+                                  bool skip_source) {
   auto row_offsets = thrust::raw_pointer_cast(csr.row_offsets.data());
-  auto column_indices = thrust::raw_pointer_cast(csr.column_indices.data());
   auto distance_values = thrust::raw_pointer_cast(distances.data());
   auto begin = thrust::make_counting_iterator<vertex_t>(0);
   auto end = thrust::make_counting_iterator<vertex_t>(
       static_cast<vertex_t>(distances.size()));
 
-  auto forward_edges = thrust::transform_reduce(
+  return thrust::transform_reduce(
       thrust::device,
       begin,
       end,
-      [row_offsets, column_indices, distance_values] __device__(vertex_t src) -> size_t {
+      [row_offsets, distance_values, skip_source] __device__(vertex_t src) -> size_t {
         auto src_distance = distance_values[src];
         if (src_distance == std::numeric_limits<vertex_t>::max()) {
           return 0;
         }
-
-        size_t accepted_edges = 0;
-        for (edge_t edge = row_offsets[src]; edge < row_offsets[src + 1]; ++edge) {
-          vertex_t dst = column_indices[edge];
-          if (distance_values[dst] == src_distance + 1) {
-            ++accepted_edges;
-          }
+        if (skip_source && src_distance == 0) {
+          return 0;
         }
-        return accepted_edges;
+        return static_cast<size_t>(row_offsets[src + 1] - row_offsets[src]);
       },
       size_t{0},
       thrust::plus<size_t>());
-
-  return 2 * forward_edges;
 }
 
 void test_bc(int num_arguments, char** argument_array) {
@@ -111,8 +104,11 @@ void test_bc(int num_arguments, char** argument_array) {
     benchmark_metrics[i] = metrics;
     auto source = source_vect[i];
     gunrock::bfs::run(G, source, distances.data().get(), predecessors.data().get());
-    total_edges_processed +=
-        count_bc_level_edges<csr_t, vertex_t, edge_t>(csr, distances);
+    auto forward_edges =
+        count_reached_vertex_edges<csr_t, vertex_t, edge_t>(csr, distances, false);
+    auto backward_edges =
+        count_reached_vertex_edges<csr_t, vertex_t, edge_t>(csr, distances, true);
+    total_edges_processed += forward_edges + backward_edges;
 
     benchmark::DESTROY_BENCH();
   }

@@ -119,6 +119,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
                              edge_t const& edge,        // edge
                              weight_t const& weight     // weight (tuple).
                              ) -> bool {
+      if (edge_counter != nullptr) {
+        atomicAdd(edge_counter, 1ULL);
+      }
       weight_t source_distance = thread::load(&distances[source]);
       weight_t distance_to_neighbor = source_distance + weight;
 
@@ -126,11 +129,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       weight_t recover_distance =
           math::atomic::min(&(distances[neighbor]), distance_to_neighbor);
 
-      bool improved = (distance_to_neighbor < recover_distance);
-      if (improved && edge_counter != nullptr) {
-        atomicAdd(edge_counter, 1ULL);
-      }
-      return improved;
+      return (distance_to_neighbor < recover_distance);
     };
 
     auto remove_completed_paths = [G, visited, iteration] __host__ __device__(
