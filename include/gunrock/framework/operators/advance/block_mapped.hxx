@@ -204,11 +204,18 @@ void execute(graph_t& G,
       >;
 
   /// @todo Is there a better place to create block_offsets? This is always a
-  /// one element array.
-  thrust::device_vector<typename frontier_t::offset_t> block_offsets(1);
+  /// one element array when the advance produces an output frontier.
+  thrust::device_vector<typename frontier_t::offset_t> block_offsets;
+  typename frontier_t::type_t* output_ptr = nullptr;
+  typename frontier_t::offset_t* block_offsets_ptr = nullptr;
+  if constexpr (output_type != advance_io_type_t::none) {
+    block_offsets.resize(1);
+    output_ptr = output.data();
+    block_offsets_ptr = block_offsets.data().get();
+  }
   launch_box.calculate_grid_dimensions_strided(num_elements);
-  launch_box.launch(context, kernel, G, op, input.data(), output.data(),
-                    num_elements, block_offsets.data().get());
+  launch_box.launch(context, kernel, G, op, input.data(), output_ptr,
+                    num_elements, block_offsets_ptr);
   context.synchronize();
 }
 
