@@ -1,0 +1,35 @@
+set(APPLICATION_NAME multi_sssp)
+
+add_executable(${APPLICATION_NAME})
+
+set(SOURCE_LIST
+    ${APPLICATION_NAME}.cu
+)
+
+target_sources(${APPLICATION_NAME} PRIVATE ${SOURCE_LIST})
+target_link_libraries(${APPLICATION_NAME} PRIVATE essentials)
+get_target_property(ESSENTIALS_ARCHITECTURES essentials CUDA_ARCHITECTURES)
+set_target_properties(${APPLICATION_NAME}
+    PROPERTIES
+        CUDA_ARCHITECTURES ${ESSENTIALS_ARCHITECTURES}
+)
+
+message(STATUS "Example Added: ${APPLICATION_NAME}")
+
+set(APPLICATION_NAME multi_sssp_throughput)
+
+add_executable(${APPLICATION_NAME})
+
+set(SOURCE_LIST
+    ${APPLICATION_NAME}.cu
+)
+
+target_sources(${APPLICATION_NAME} PRIVATE ${SOURCE_LIST})
+target_link_libraries(${APPLICATION_NAME} PRIVATE essentials)
+get_target_property(ESSENTIALS_ARCHITECTURES essentials CUDA_ARCHITECTURES)
+set_target_properties(${APPLICATION_NAME}
+    PROPERTIES
+        CUDA_ARCHITECTURES ${ESSENTIALS_ARCHITECTURES}
+)
+
+message(STATUS "Example Added: ${APPLICATION_NAME}")
