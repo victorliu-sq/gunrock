@@ -1,4 +1,12 @@
 #include <cxxopts.hpp>
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+#include <numeric>
+#include <random>
+#include <sstream>
+#include <string>
+#include <vector>
 
 namespace gunrock {
 namespace io {
@@ -11,6 +19,7 @@ struct parameters_t {
   std::string json_file = "";
   std::string tag_string = "";
   int num_runs = 1;
+  int source_count = -1;
   cxxopts::Options options;
   bool export_metrics = false;
   bool validate = false;
@@ -39,15 +48,19 @@ struct parameters_t {
     // Algorithms with sources
     if (algorithm == "Betweenness Centrality" ||
         algorithm == "Breadth First Search" ||
-        algorithm == "Single Source Shortest Path" || algorithm == "DAWN") {
+        algorithm == "Single Source Shortest Path" ||
+        algorithm == "Multi Source Shortest Path" || algorithm == "DAWN") {
       options.add_options()("s,src",
                             "Source(s) (random if omitted); "
-                            "comma-separated string of ints",
+                            "comma-separated ints",
                             cxxopts::value<std::string>())  // source
+          ("src-count", "Number of unique random sources to generate",
+           cxxopts::value<int>())
           ("n,num_runs", "Number of runs (ignored if multiple sources passed)",
            cxxopts::value<int>());  // runs
       if (algorithm == "Breadth First Search" ||
-          algorithm == "Single Source Shortest Path" || algorithm == "DAWN") {
+          algorithm == "Single Source Shortest Path" ||
+          algorithm == "Multi Source Shortest Path" || algorithm == "DAWN") {
         options.add_options()("validate", "CPU validation");  // validate
       }
     } else {
@@ -96,6 +109,10 @@ struct parameters_t {
       source_string = result["src"].as<std::string>();
     }
 
+    if (result.count("src-count") == 1) {
+      source_count = result["src-count"].as<int>();
+    }
+
     if (result.count("json_dir") == 1) {
       json_dir = result["json_dir"].as<std::string>();
     }
@@ -105,6 +122,30 @@ struct parameters_t {
     }
   }
 };
+
+void parse_source_tokens(std::string source_str,
+                         std::vector<int>* source_vect,
+                         int n_vertices) {
+  std::replace(source_str.begin(), source_str.end(), ',', ' ');
+  std::stringstream ss(source_str);
+  std::string source;
+
+  while (ss >> source) {
+    char* end = nullptr;
+    long parsed_source = std::strtol(source.c_str(), &end, 10);
+    if (end == source.c_str() || *end != '\0') {
+      std::cout << "Error: Invalid source: " << source << "\n";
+      exit(1);
+    }
+    if (parsed_source >= 0 && parsed_source < n_vertices) {
+      int source_int = static_cast<int>(parsed_source);
+      source_vect->push_back(source_int);
+    } else {
+      std::cout << "Error: Source out of range: " << parsed_source << "\n";
+      exit(1);
+    }
+  }
+}
 
 void parse_source_string(std::string source_str,
                          std::vector<int>* source_vect,
@@ -119,30 +160,34 @@ void parse_source_string(std::string source_str,
       source_vect->push_back(dist(engine));
     }
   } else {
-    std::stringstream ss(source_str);
-    while (ss.good()) {
-      std::string source;
-      getline(ss, source, ',');
-      int source_int;
-      try {
-        source_int = std::stoi(source);
-      } catch (...) {
-        std::cout << "Error: Invalid source"
-                  << "\n";
-        exit(1);
-      }
-      if (source_int >= 0 && source_int < n_vertices) {
-        source_vect->push_back(source_int);
-      } else {
-        std::cout << "Error: Invalid source"
-                  << "\n";
-        exit(1);
-      }
+    parse_source_tokens(source_str, source_vect, n_vertices);
+    if (source_vect->empty()) {
+      std::cout << "Error: No valid source nodes found"
+                << "\n";
+      exit(1);
     }
     if (source_vect->size() == 1) {
       source_vect->insert(source_vect->end(), n_runs - 1, source_vect->at(0));
     }
   }
+}
+
+void generate_unique_random_sources(int source_count,
+                                    std::vector<int>* source_vect,
+                                    int n_vertices) {
+  if (source_count <= 0 || source_count > n_vertices) {
+    std::cout << "Error: --src-count must be between 1 and the number of graph vertices ("
+              << n_vertices << "): " << source_count << "\n";
+    exit(1);
+  }
+
+  std::vector<int> vertices(n_vertices);
+  std::iota(vertices.begin(), vertices.end(), 0);
+  std::random_device seed;
+  std::mt19937 engine(seed());
+  std::shuffle(vertices.begin(), vertices.end(), engine);
+  source_vect->insert(source_vect->end(), vertices.begin(),
+                      vertices.begin() + source_count);
 }
 
 void parse_tag_string(std::string tag_str, std::vector<std::string>* tag_vect) {

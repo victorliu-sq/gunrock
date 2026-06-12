@@ -2,9 +2,53 @@
 #include "multi_sssp_cpu.hxx"
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/util/performance.hxx>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <vector>
 
 using namespace gunrock;
 using namespace memory;
+
+struct normalized_args_t {
+  std::vector<std::string> storage;
+  std::vector<char*> argv;
+};
+
+normalized_args_t normalize_multi_sssp_args(int argc, char** argv) {
+  normalized_args_t normalized;
+  normalized.storage.reserve(argc);
+
+  for (int i = 0; i < argc; i++) {
+    std::string arg = argv[i];
+    if (arg == "--src" || arg == "-s") {
+      std::string sources = "--src=";
+      bool has_source = false;
+      i++;
+      while (i < argc && argv[i][0] != '-') {
+        if (has_source) sources += ",";
+        sources += argv[i];
+        has_source = true;
+        i++;
+      }
+      if (!has_source) {
+        std::cerr << "Error: --src requires at least one source id" << std::endl;
+        std::exit(1);
+      }
+      normalized.storage.push_back(sources);
+      i--;
+    } else {
+      normalized.storage.push_back(arg);
+    }
+  }
+
+  normalized.argv.reserve(normalized.storage.size());
+  for (auto& value : normalized.storage) {
+    normalized.argv.push_back(const_cast<char*>(value.c_str()));
+  }
+
+  return normalized;
+}
 
 void test_multi_sssp(int num_arguments, char** argument_array) {
   using vertex_t = int;
@@ -14,8 +58,10 @@ void test_multi_sssp(int num_arguments, char** argument_array) {
   using csr_t =
       format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
 
-  std::string algorithm = "Single Source Shortest Path";
-  gunrock::io::cli::parameters_t params(num_arguments, argument_array,
+  std::string algorithm = "Multi Source Shortest Path";
+  auto normalized_args = normalize_multi_sssp_args(num_arguments, argument_array);
+  gunrock::io::cli::parameters_t params(static_cast<int>(normalized_args.argv.size()),
+                                        normalized_args.argv.data(),
                                         algorithm);
 
   io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
@@ -38,8 +84,18 @@ void test_multi_sssp(int num_arguments, char** argument_array) {
   thrust::device_vector<unsigned long long> edges_processed(1);
 
   std::vector<int> source_vect;
-  gunrock::io::cli::parse_source_string(params.source_string, &source_vect,
-                                        n_vertices, params.num_runs);
+  if (!params.source_string.empty() && params.source_count >= 0) {
+    std::cerr << "Error: use either --src or --src-count, not both"
+              << std::endl;
+    std::exit(1);
+  }
+  if (params.source_count >= 0) {
+    gunrock::io::cli::generate_unique_random_sources(
+        params.source_count, &source_vect, n_vertices);
+  } else {
+    gunrock::io::cli::parse_source_string(params.source_string, &source_vect,
+                                          n_vertices, params.num_runs);
+  }
 
   std::vector<std::string> tag_vect;
   gunrock::io::cli::parse_tag_string(params.tag_string, &tag_vect);
