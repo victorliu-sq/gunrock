@@ -53,14 +53,18 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using edge_t = typename graph_t::edge_type;
   using weight_t = typename graph_t::weight_type;
 
+  thrust::device_vector<vertex_t> sources;
   thrust::device_vector<vertex_t> visited;
 
   void init() override {
     auto g = this->get_graph();
     auto n_vertices = g.get_number_of_vertices();
+    sources.resize(this->param.n_sources);
     visited.resize(n_vertices);
 
     auto policy = this->context->get_context(0)->execution_policy();
+    thrust::copy(policy, this->param.sources,
+                 this->param.sources + this->param.n_sources, sources.begin());
     thrust::fill(policy, visited.begin(), visited.end(), -1);
   }
 
@@ -75,10 +79,11 @@ struct problem_t : gunrock::problem_t<graph_t> {
     thrust::fill(policy, d_distances, d_distances + n_vertices,
                  std::numeric_limits<weight_t>::max());
 
-    for (std::size_t i = 0; i < this->param.n_sources; ++i) {
-      auto source = this->param.sources[i];
-      thrust::fill(policy, d_distances + source, d_distances + source + 1, 0);
-    }
+    auto distances = this->result.distances;
+    thrust::for_each(policy, sources.begin(), sources.end(),
+                     [distances] __host__ __device__(vertex_t source) {
+                       distances[source] = 0;
+                     });
 
     thrust::fill(policy, visited.begin(), visited.end(), -1);
   }
@@ -98,9 +103,12 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   void prepare_frontier(frontier_t* f,
                         gcuda::multi_context_t& context) override {
     auto P = this->get_problem();
-    for (std::size_t i = 0; i < P->param.n_sources; ++i) {
-      f->push_back(P->param.sources[i]);
-    }
+    auto context0 = context.get_context(0);
+    auto policy = context0->execution_policy();
+
+    f->reserve(P->param.n_sources);
+    f->set_number_of_elements(P->param.n_sources);
+    thrust::copy(policy, P->sources.begin(), P->sources.end(), f->begin());
   }
 
   void loop(gcuda::multi_context_t& context) override {
