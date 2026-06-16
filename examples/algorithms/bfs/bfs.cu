@@ -98,11 +98,13 @@ void test_bfs(int num_arguments, char** argument_array) {
           source_vect, tag_vect, num_arguments, argument_array);
   }
 
-  // Print info for last run
+  // Print info for all runs so experiment scripts can compute confidence intervals.
   std::cout << "Source : " << source_vect.back() << "\n";
   print::head(distances, 40, "GPU distances");
-  std::cout << "GPU Elapsed Time : " << run_times[n_runs - 1] << " (ms)"
-            << std::endl;
+  for (size_t i = 0; i < run_times.size(); i++) {
+    std::cout << "GPU Elapsed Time : " << run_times[i] << " (ms)"
+              << std::endl;
+  }
 
   // --
   // CPU Run

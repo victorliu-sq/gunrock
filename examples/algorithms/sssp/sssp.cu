@@ -114,8 +114,10 @@ void test_sssp(int num_arguments, char** argument_array) {
   // Log
 
   print::head(distances, 40, "GPU distances");
-  std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]
-            << " (ms)" << std::endl;
+  for (size_t i = 0; i < run_times.size(); i++) {
+    std::cout << "GPU Elapsed Time : " << run_times[i] << " (ms)"
+              << std::endl;
+  }
 
   // --
   // CPU Run

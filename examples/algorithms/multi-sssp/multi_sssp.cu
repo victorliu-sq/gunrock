@@ -99,16 +99,18 @@ void test_multi_sssp(int num_arguments, char** argument_array) {
   std::vector<std::string> tag_vect;
   gunrock::io::cli::parse_tag_string(params.tag_string, &tag_vect);
 
+  size_t n_runs = params.num_runs > 0 ? params.num_runs : 1;
   std::vector<float> run_times;
-  auto benchmark_metrics = std::vector<benchmark::host_benchmark_t>(1);
+  auto benchmark_metrics = std::vector<benchmark::host_benchmark_t>(n_runs);
 
-  benchmark::INIT_BENCH();
-  run_times.push_back(gunrock::multi_sssp::run(
-      G, source_vect.data(), source_vect.size(), distances.data().get(),
-      predecessors.data().get()));
-
-  benchmark_metrics[0] = benchmark::EXTRACT();
-  benchmark::DESTROY_BENCH();
+  for (size_t i = 0; i < n_runs; i++) {
+    benchmark::INIT_BENCH();
+    run_times.push_back(gunrock::multi_sssp::run(
+        G, source_vect.data(), source_vect.size(), distances.data().get(),
+        predecessors.data().get()));
+    benchmark_metrics[i] = benchmark::EXTRACT();
+    benchmark::DESTROY_BENCH();
+  }
 
   if (params.export_metrics) {
     gunrock::util::stats::export_performance_stats(
@@ -118,8 +120,10 @@ void test_multi_sssp(int num_arguments, char** argument_array) {
   }
 
   print::head(distances, 40, "GPU distances");
-  std::cout << "GPU Elapsed Time : " << run_times.back() << " (ms)"
-            << std::endl;
+  for (size_t i = 0; i < run_times.size(); i++) {
+    std::cout << "GPU Elapsed Time : " << run_times[i] << " (ms)"
+              << std::endl;
+  }
 
   if (params.validate) {
     thrust::host_vector<weight_t> h_distances(n_vertices);
