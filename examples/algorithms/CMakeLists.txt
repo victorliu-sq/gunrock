@@ -1,6 +1,7 @@
 # begin /* Add algorithms' subdirectories */
 add_subdirectory(sssp)
 add_subdirectory(multi-sssp)
+add_subdirectory(xblossom)
 add_subdirectory(bfs)
 add_subdirectory(dawn)
 add_subdirectory(pr)
