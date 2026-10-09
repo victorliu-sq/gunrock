@@ -163,6 +163,9 @@ class engine_t {
     operators::advance::execute<LB, operators::advance_direction_t::forward,
                                 operators::advance_io_type_t::vertices, operators::advance_io_type_t::none>(
         G_, op, &input_frontier_, &output_frontier_, segments_, *context_);
+    // merge_path launches on the context's stream without synchronizing
+    // (block_mapped does); the next step reads results on the host.
+    context_->get_context(0)->synchronize();
   }
 
   void InitAlternatingForest() {
