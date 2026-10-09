@@ -99,7 +99,8 @@ class engine_t {
     return mate;
   }
 
- private:
+  // Public: nvcc requires the enclosing function of an extended __device__
+  // lambda to be public.
   graph_t& G_;
   std::shared_ptr<gcuda::multi_context_t> context_;
   size_t nnodes_;
