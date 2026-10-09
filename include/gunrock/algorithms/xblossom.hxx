@@ -172,11 +172,11 @@ class engine_t {
     dev_found_.SetH2D(DFLAG_FALSE);
 
     const index_t nnodes = nnodes_;
-    auto matching = dev_matching_.DeviceView();
-    auto is_even = is_even_.DeviceView();
-    auto tree_roots = tree_roots_.DeviceView();
-    auto queue = enode_queue_.DeviceView();
-    auto path_table = path_table_.DeviceView();
+    auto matching_v = dev_matching_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
 
     enode_queue_.Clear();
     enode_queue_.PrepareForAppendingENode1();
@@ -184,7 +184,12 @@ class engine_t {
     // is still exposed.
     operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
         G_,
-        [=] __device__(vertex_t const& x) mutable {
+        [=] __device__(vertex_t const& x) {
+      auto matching = matching_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto path_table = path_table_v;
           if (matching[x] == nnodes) {
             is_even[x] = 1;
             tree_roots[x] = x;
@@ -206,7 +211,12 @@ class engine_t {
     // Even nodes of the kept trees join the frontier.
     operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(
         G_,
-        [=] __device__(vertex_t const& x) mutable {
+        [=] __device__(vertex_t const& x) {
+      auto matching = matching_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto path_table = path_table_v;
           if (matching[x] != nnodes) {
             index_t root = tree_roots[x];
             if (root != nnodes && matching[root] == nnodes && is_even[x]) queue.AppendENode2(x);
@@ -219,14 +229,20 @@ class engine_t {
   bool FindAndFlipAugmentingPathInAlternatingForest() {
     if (LoadFrontier() == 0) return false;
     const index_t nnodes = nnodes_;
-    auto matching = dev_matching_.DeviceView();
-    auto path_table = path_table_.DeviceView();
-    auto is_even = is_even_.DeviceView();
-    auto tree_roots = tree_roots_.DeviceView();
-    auto locks = atomic_locks_tree_.DeviceView();
-    auto found = dev_found_.DeviceView();
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto locks_v = atomic_locks_tree_.DeviceView();
+    auto found_v = dev_found_.DeviceView();
 
-    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) mutable -> bool {
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto locks = locks_v;
+      auto found = found_v;
       index_t root_v = tree_roots[v];
       index_t root_w = tree_roots[w];
       if (is_even[w] && root_v != root_w && root_v != nnodes && root_w != nnodes) {
@@ -250,15 +266,21 @@ class engine_t {
     if (enode_queue_.Size() == 0) return;
     LoadFrontier();
     const index_t nnodes = nnodes_;
-    auto matching = dev_matching_.DeviceView();
-    auto path_table = path_table_.DeviceView();
-    auto is_even = is_even_.DeviceView();
-    auto tree_roots = tree_roots_.DeviceView();
-    auto queue = enode_queue_.DeviceView();
-    auto locks = atomic_locks_match_.DeviceView();
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto locks_v = atomic_locks_match_.DeviceView();
 
     enode_queue_.PrepareForAppendingENode1();
-    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) mutable -> bool {
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
       index_t root_v = tree_roots[v];
       index_t root_w = tree_roots[w];
       if (root_w == nnodes) {
@@ -284,24 +306,34 @@ class engine_t {
     if (enode_queue_.Size() == 0) return;
     LoadFrontier();
     const index_t nnodes = nnodes_;
-    auto matching = dev_matching_.DeviceView();
-    auto path_table = path_table_.DeviceView();
-    auto is_even = is_even_.DeviceView();
-    auto tree_roots = tree_roots_.DeviceView();
-    auto queue = enode_queue_.DeviceView();
-    auto locks = atomic_locks_odd_nodes_.DeviceView();
+    auto matching_v = dev_matching_.DeviceView();
+    auto path_table_v = path_table_.DeviceView();
+    auto is_even_v = is_even_.DeviceView();
+    auto tree_roots_v = tree_roots_.DeviceView();
+    auto queue_v = enode_queue_.DeviceView();
+    auto locks_v = atomic_locks_odd_nodes_.DeviceView();
 
     enode_queue_.PrepareForAppendingENode2();
     path_table_.ResetBlossomBuffer();
 
     blossom_offset_list_.Clear();
-    auto blossom_offsets = blossom_offset_list_.DeviceView();
-    auto nodes_in_blossom = num_nodes_in_blossom_list_.DeviceView();
-    auto odd_in_blossom = num_odd_nodes_in_blossom_list_.DeviceView();
-    auto odd_vside_in_blossom = num_odd_nodes_vside_in_blossom_list_.DeviceView();
+    auto blossom_offsets_v = blossom_offset_list_.DeviceView();
+    auto nodes_in_blossom_v = num_nodes_in_blossom_list_.DeviceView();
+    auto odd_in_blossom_v = num_odd_nodes_in_blossom_list_.DeviceView();
+    auto odd_vside_in_blossom_v = num_odd_nodes_vside_in_blossom_list_.DeviceView();
 
     // Find the blossoms closed by frontier edges.
-    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) mutable -> bool {
+    Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
+      auto blossom_offsets = blossom_offsets_v;
+      auto nodes_in_blossom = nodes_in_blossom_v;
+      auto odd_in_blossom = odd_in_blossom_v;
+      auto odd_vside_in_blossom = odd_vside_in_blossom_v;
       index_t root_v = tree_roots[v];
       index_t root_w = tree_roots[w];
       if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
@@ -330,8 +362,19 @@ class engine_t {
     cuda_stream_.Sync();
     const size_t total_transforms = num_odd_nodes_in_blossom_psum_[num_blossom];
     if (total_transforms == 0) return;
-    auto psum = num_odd_nodes_in_blossom_psum_.DeviceView();
-    LaunchKernelForEachMax(cuda_stream_, total_transforms, [=] __device__(index_t tid) mutable {
+    auto psum_v = num_odd_nodes_in_blossom_psum_.DeviceView();
+    LaunchKernelForEachMax(cuda_stream_, total_transforms, [=] __device__(index_t tid) {
+      auto matching = matching_v;
+      auto path_table = path_table_v;
+      auto is_even = is_even_v;
+      auto tree_roots = tree_roots_v;
+      auto queue = queue_v;
+      auto locks = locks_v;
+      auto blossom_offsets = blossom_offsets_v;
+      auto nodes_in_blossom = nodes_in_blossom_v;
+      auto odd_in_blossom = odd_in_blossom_v;
+      auto odd_vside_in_blossom = odd_vside_in_blossom_v;
+      auto psum = psum_v;
       index_t b = FindRightmostLTEQ(psum, num_blossom + 1, tid);
       index_t blossom_offset = blossom_offsets[b];
       index_t nnodes_in_blossom = nodes_in_blossom[b];
