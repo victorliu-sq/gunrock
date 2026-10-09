@@ -17,7 +17,7 @@
  * What Gunrock does here: each step's frontier (the even nodes of the
  * X-Blossom node queue) goes into a gunrock frontier_t and the three steps are
  * advance operators with load balancing LB (block_mapped = Gunrock's default,
- * merge_path, thread_mapped); the two per-vertex initialisation passes are
+ * or thread_mapped); the two per-vertex initialisation passes are
  * parallel_for. What stays X-Blossom's own (vendored, ./xblossom/): the
  * device path table, the even-node queue, the per-tree / per-match /
  * per-odd-node locks and the blossom transform. One semantic difference from

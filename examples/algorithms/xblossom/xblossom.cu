@@ -1,6 +1,6 @@
 // X-Blossom++ maximum matching on Gunrock (include/gunrock/algorithms/xblossom.hxx).
 //
-//   xblossom -m <graph.mtx> [-d dataset] [-l block|merge|thread] [-p path_buffer_ratio]
+//   xblossom -m <graph.mtx> [-d dataset] [-l block|thread] [-p path_buffer_ratio]
 //            [-w warmup] [-r rounds]
 //
 // Runs warm-up + timed rounds, each a full maximum matching from the empty
@@ -120,8 +120,10 @@ int main(int argc, char** argv) {
   std::fflush(stdout);
 
   if (o.lb == "block") return run<operators::load_balance_t::block_mapped>(G, o, row, col);
-  if (o.lb == "merge") return run<operators::load_balance_t::merge_path>(G, o, row, col);
   if (o.lb == "thread") return run<operators::load_balance_t::thread_mapped>(G, o, row, col);
-  std::fprintf(stderr, "-l must be block, merge or thread\n");
+  // merge_path is left out: on this Gunrock build it issues no work for these
+  // advances (no error, the operator is never called), and none of Gunrock's
+  // own algorithms here use it.
+  std::fprintf(stderr, "-l must be block or thread\n");
   return 2;
 }
