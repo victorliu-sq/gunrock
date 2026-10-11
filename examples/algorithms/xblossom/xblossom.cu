@@ -1,13 +1,15 @@
 // X-Blossom++ maximum matching on Gunrock (include/gunrock/algorithms/xblossom.hxx).
 //
 //   xblossom -m <graph.mtx> [-d dataset] [-l block|thread] [-p path_buffer_ratio]
-//            [-w warmup] [-r rounds]
+//            [-M mat|nomat] [-o odd_node_ratio] [-w warmup] [-r rounds]
 //
 // Runs warm-up + timed rounds, each a full maximum matching from the empty
 // matching on a fresh engine (only FindMaximumMatch is timed, as XB++), checks
 // every matching (mutual, along graph edges) and prints the GACGE lines
 //   XBConfig: ...                                       once
 //   XBRound: index runtime_s matching_size valid        per timed round
+//   XBPhases: index aug_path_s expand_s blossom_s steps   per timed round
+//   XBMemory: index paths_used blossom_buffer_peak blossom_list_peak buffer_capacity list_capacity
 //   XBResult: status matching_size valid rounds mean_runtime_s
 #include <gunrock/algorithms/xblossom.hxx>
 
@@ -24,8 +26,8 @@ using namespace memory;
 namespace {
 
 struct options_t {
-  std::string graph, dataset = "unknown", lb = "block";
-  size_t path_buffer_ratio = 1;
+  std::string graph, dataset = "unknown", lb = "block", blossom = "mat";
+  size_t path_buffer_ratio = 1, odd_node_ratio = 30;
   int warmup = 1, rounds = 10;
 };
 
@@ -37,11 +39,14 @@ options_t parse(int argc, char** argv) {
     else if (k == "-d") o.dataset = v;
     else if (k == "-l") o.lb = v;
     else if (k == "-p") o.path_buffer_ratio = std::stoul(v);
+    else if (k == "-M") o.blossom = v;
+    else if (k == "-o") o.odd_node_ratio = std::stoul(v);
     else if (k == "-w") o.warmup = std::stoi(v);
     else if (k == "-r") o.rounds = std::stoi(v);
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
   }
   if (o.graph.empty()) { std::fprintf(stderr, "usage: xblossom -m <graph.mtx> ...\n"); std::exit(2); }
+  if (o.blossom != "mat" && o.blossom != "nomat") { std::fprintf(stderr, "-M must be mat or nomat\n"); std::exit(2); }
   return o;
 }
 
@@ -69,7 +74,7 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
   long first = -2;
   bool all_valid = true, all_same = true;
   for (int i = 0; i < o.warmup + o.rounds; i++) {
-    xblossom::engine_t<LB, graph_t> engine(G, o.path_buffer_ratio, context);
+    xblossom::engine_t<LB, graph_t> engine(G, o.path_buffer_ratio, o.odd_node_ratio, o.blossom == "nomat", context);
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<index_t> mate = engine.FindMaximumMatch();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -82,6 +87,14 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
     total += secs;
     std::printf("XBRound: index=%d runtime_s=%.9f matching_size=%ld valid=%d\n", i - o.warmup, secs, size,
                 valid ? 1 : 0);
+    double aug_s, expand_s, blossom_s;
+    engine.PhaseSeconds(aug_s, expand_s, blossom_s);
+    std::printf("XBPhases: index=%d aug_path_s=%.9f expand_s=%.9f blossom_s=%.9f steps=%zu\n", i - o.warmup, aug_s,
+                expand_s, blossom_s, engine.Steps());
+    std::printf("XBMemory: index=%d paths_used=%zu blossom_buffer_peak=%zu blossom_list_peak=%zu "
+                "buffer_capacity=%zu list_capacity=%zu\n", i - o.warmup, engine.PathsUsed(),
+                engine.PeakBlossomBufferNodes(), engine.PeakBlossomListEntries(), engine.BufferCapacity(),
+                engine.BlossomListCapacity());
     std::fflush(stdout);
   }
   const char* status = !all_valid ? "invalid_matching" : (!all_same ? "matching_size_varies" : "ok");
@@ -112,11 +125,11 @@ int main(int argc, char** argv) {
   long max_degree = 0;
   for (size_t v = 0; v + 1 < row.size(); v++) max_degree = std::max<long>(max_degree, row[v + 1] - row[v]);
 
-  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s dataset=%s nodes=%d edges=%ld "
-              "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu\n",
-              o.lb.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
+  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s dataset=%s nodes=%d edges=%ld "
+              "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu odd_node_ratio=%zu\n",
+              o.lb.c_str(), o.blossom.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
               static_cast<long>(G.get_number_of_edges()) / 2, max_degree, o.warmup, o.rounds,
-              o.path_buffer_ratio);
+              o.path_buffer_ratio, o.odd_node_ratio);
   std::fflush(stdout);
 
   if (o.lb == "block") return run<operators::load_balance_t::block_mapped>(G, o, row, col);

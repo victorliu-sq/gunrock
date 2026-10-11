@@ -21,6 +21,7 @@ public:
 
   DEV_INLINE index_t Append(T val) {
     auto idx = atomicAdd(&counter_, 1);
+    assert(static_cast<size_t>(idx) < array_.size()); // list capacity exceeded
     array_[idx] = val;
     return idx;
   }
@@ -47,6 +48,7 @@ public:
 
   DEV_INLINE index_t Reserve(size_t size) {
     index_t offset = atomicAdd(&counter_, size);
+    assert(static_cast<size_t>(offset) + size <= array_.size()); // buffer capacity exceeded
     return offset;
   }
 

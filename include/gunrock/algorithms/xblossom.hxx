@@ -41,12 +41,40 @@
 #include "utils/cuda_algo.h"
 #include "enode_queue/enode_queue.h"
 #include "path_table/path_table.h"
+#include <algorithm>
+#include <chrono>
 
 namespace gunrock {
 namespace xblossom {
 
 // Size of the blossom lists, per node (XB++'s ODD_NODE_RATIO).
-constexpr size_t kOddNodeRatio = 30;
+constexpr size_t kOddNodeRatio = 30; // default capacity of the blossom lists, per node
+
+// nomat: walk even node s's chain down to the blossom base and claim every
+// odd node still odd (per-node lock); each claim is one transform task
+// (node, s, o, base), the node becoming even with the path around the cycle
+// through o. Same as X-Blossom++'s ClaimOddNodesOnChain (xb_gpu_engine.cu).
+template <typename path_table_t, typename flags_t, typename list_t, typename array_t>
+__device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, flags_t& is_even,
+                                                     flags_t& atomic_locks_odd_nodes, list_t& task_node,
+                                                     array_t& task_s, array_t& task_o, array_t& task_base,
+                                                     index_t s, index_t o, index_t base) {
+  index_t cur = s;
+  while (cur != base) {
+    const zblossom::dev::OffsetLength ol = path_table.LoadOL(cur);
+    if (ol.second == 0) return;
+    for (index_t i = 0; i + 1 < ol.second; i++) {
+      const index_t n = path_table.LoadPath(ol.first + i);
+      if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
+        const index_t t = task_node.Append(n);
+        task_s[t] = s;
+        task_o[t] = o;
+        task_base[t] = base;
+      }
+    }
+    cur = path_table.LoadPath(ol.first + ol.second - 1);
+  }
+}
 
 template <operators::load_balance_t LB, typename graph_t>
 class engine_t {
@@ -56,9 +84,14 @@ class engine_t {
   using frontier_t = frontier::frontier_t<vertex_t, edge_t, frontier::frontier_kind_t::vertex_frontier>;
 
  public:
-  engine_t(graph_t& G, size_t path_table_buffer_ratio, std::shared_ptr<gcuda::multi_context_t> context)
+  // nomat: no blossom buffer, odd nodes claimed while the closing edge walks
+  // its chains and made even from the path table (X-Blossom++'s XB_BLOSSOM_MAT 1);
+  // odd_node_ratio sizes the blossom lists (records under mat, tasks under nomat).
+  engine_t(graph_t& G, size_t path_table_buffer_ratio, size_t odd_node_ratio, bool nomat,
+           std::shared_ptr<gcuda::multi_context_t> context)
       : G_(G),
         context_(context),
+        nomat_(nomat),
         nnodes_(G.get_number_of_vertices()),
         dev_matching_(nnodes_, nnodes_),
         path_table_(nnodes_, path_table_buffer_ratio),
@@ -69,11 +102,11 @@ class engine_t {
         atomic_locks_match_(nnodes_),
         atomic_locks_odd_nodes_(nnodes_),
         enode_queue_(nnodes_),
-        blossom_offset_list_(kOddNodeRatio * nnodes_ + 1),
-        num_nodes_in_blossom_list_(kOddNodeRatio * nnodes_ + 1),
-        num_odd_nodes_vside_in_blossom_list_(kOddNodeRatio * nnodes_ + 1),
-        num_odd_nodes_in_blossom_list_(kOddNodeRatio * nnodes_ + 1),
-        num_odd_nodes_in_blossom_psum_(kOddNodeRatio * nnodes_ + 1),
+        blossom_offset_list_(odd_node_ratio * nnodes_ + 1),
+        num_nodes_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
+        num_odd_nodes_vside_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
+        num_odd_nodes_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
+        num_odd_nodes_in_blossom_psum_(odd_node_ratio * nnodes_ + 1),
         input_frontier_(nnodes_),
         output_frontier_(1) {
     size_t bytes = 0;
@@ -99,11 +132,31 @@ class engine_t {
     return mate;
   }
 
+  // Accumulated phase times (s) and step count of the matching so far
+  void PhaseSeconds(double& aug_path_s, double& expand_s, double& blossom_s) const {
+    aug_path_s = t_aug_;
+    expand_s = t_expand_;
+    blossom_s = t_blossom_;
+  }
+  size_t Steps() const { return steps_; }
+  // Memory footprint of the blossom phase: the most nodes the blossom buffer
+  // held in a step (mat only), the most entries the blossom lists held in a
+  // step (closing-edge records under mat, odd-node tasks under nomat), the
+  // path segments written, and the capacities
+  size_t PeakBlossomBufferNodes() const { return peak_buffer_; }
+  size_t PeakBlossomListEntries() const { return peak_list_; }
+  size_t PathsUsed() const { return path_table_.PathsUsed(); }
+  size_t BufferCapacity() const { return path_table_.BufferCapacity(); }
+  size_t BlossomListCapacity() const { return num_odd_nodes_in_blossom_list_.size(); }
+
   // Public: nvcc requires the enclosing function of an extended __device__
   // lambda to be public.
   graph_t& G_;
   std::shared_ptr<gcuda::multi_context_t> context_;
+  bool nomat_;
   size_t nnodes_;
+  double t_aug_{0}, t_expand_{0}, t_blossom_{0};
+  size_t steps_{0}, peak_buffer_{0}, peak_list_{0};
   int found_{DFLAG_FALSE};
   int exhausted_{DFLAG_FALSE};
 
@@ -134,9 +187,22 @@ class engine_t {
 
   void FindAndFlipAugmentingPath() {
     InitAlternatingForest();
-    while (!IsExhausted() && !FindAndFlipAugmentingPathInAlternatingForest()) {
+    using clock = std::chrono::high_resolution_clock;
+    auto secs = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    while (true) {
+      if (IsExhausted()) break;
+      auto t0 = clock::now();
+      bool found = FindAndFlipAugmentingPathInAlternatingForest();
+      auto t1 = clock::now();
+      t_aug_ += secs(t0, t1);
+      if (found) break;
       ExpandAlternatingForest();
+      auto t2 = clock::now();
+      t_expand_ += secs(t1, t2);
       TransformOddNodesInBlossom();
+      auto t3 = clock::now();
+      t_blossom_ += secs(t2, t3);
+      steps_++;
     }
   }
 
@@ -327,7 +393,53 @@ class engine_t {
     auto odd_in_blossom_v = num_odd_nodes_in_blossom_list_.DeviceView();
     auto odd_vside_in_blossom_v = num_odd_nodes_vside_in_blossom_list_.DeviceView();
 
-    // Find the blossoms closed by frontier edges.
+    if (nomat_) {
+      // nomat: find the base, claim the odd nodes still odd on both chains
+      // (the lists hold: node, s, o, base), no cycle written
+      Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+        auto matching = matching_v;
+        auto path_table = path_table_v;
+        auto is_even = is_even_v;
+        auto tree_roots = tree_roots_v;
+        auto locks = locks_v;
+        auto task_node = blossom_offsets_v;
+        auto task_s = nodes_in_blossom_v;
+        auto task_o = odd_vside_in_blossom_v;
+        auto task_base = odd_in_blossom_v;
+        index_t root_v = tree_roots[v];
+        index_t root_w = tree_roots[w];
+        if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
+          index_t base;
+          path_table.FindBlossomBaseByAnchorNode(v, w, base);
+          ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, v, w, base);
+          ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, w, v, base);
+        }
+        return false;
+      });
+      const size_t num_tasks = blossom_offset_list_.size();
+      peak_list_ = std::max(peak_list_, num_tasks);
+      if (num_tasks == 0) return;
+      // one task per claimed odd node: its path around the cycle, from the path table
+      LaunchKernelForEachMax(cuda_stream_, num_tasks, [=] __device__(index_t t) {
+        auto path_table = path_table_v;
+        auto is_even = is_even_v;
+        auto queue = queue_v;
+        auto task_node = blossom_offsets_v;
+        auto task_s = nodes_in_blossom_v;
+        auto task_o = odd_vside_in_blossom_v;
+        auto task_base = odd_in_blossom_v;
+        const index_t u = task_node[t];
+        const index_t s = task_s[t];
+        const index_t o = task_o[t];
+        const index_t base = task_base[t];
+        path_table.ExpandOddNodeAroundBlossom(u, s, o, base, path_table.CountChainBefore(s, u));
+        atomicExch(&is_even[u], 1);
+        queue.AppendENode2(u);
+      });
+      return;
+    }
+
+    // mat (as is): find the blossoms closed by frontier edges, each materialised in the blossom buffer
     Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
       auto matching = matching_v;
       auto path_table = path_table_v;
@@ -360,6 +472,8 @@ class engine_t {
 
     // Make their odd nodes even (one tasklet per odd node).
     const size_t num_blossom = blossom_offset_list_.size();
+    peak_list_ = std::max(peak_list_, num_blossom);
+    peak_buffer_ = std::max(peak_buffer_, path_table_.BlossomBufferUsed());
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(thrust::raw_pointer_cast(scan_temp_.data()), scan_temp_bytes_,
                                              num_odd_nodes_in_blossom_list_.begin(),
                                              num_odd_nodes_in_blossom_psum_.begin(),

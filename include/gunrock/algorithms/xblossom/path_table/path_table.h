@@ -1,6 +1,14 @@
 // Vendored from X-Blossom (src/include/path_table/path_table.h) for the Gunrock X-Blossom app.
 #ifndef PATH_TABLE_H
 #define PATH_TABLE_H
+// 1 (XB++): the blossom phase finds blossoms in one kernel and transforms odd
+// nodes in another, so a kernel never reads what another worker published in
+// it; 0: nested, reads must be coherent (xbsm_gpu/xb_gpu_engine.h).
+#ifndef XB_BLOSSOM_FLAT
+#define XB_BLOSSOM_FLAT 1
+#endif
+
+#include <vector>
 #include <utils/dev_array.h>
 #include <utils/types_gpu.h>
 #include <utils/dev_value.h>
@@ -140,6 +148,16 @@ namespace zblossom {
   namespace dev {
     class PathTableView;
 
+    // A node's path segment: (offset into the path buffer, length). It is
+    // 8 bytes and is published / read as one 64-bit word (PathTableView::StoreOL
+    // / LoadOL), so a worker that walks the forest while another publishes a
+    // segment never sees a torn (new offset, old length) pair.
+    struct OffsetLength {
+      index_t first;
+      index_t second;
+    };
+    static_assert(sizeof(OffsetLength) == 8, "OffsetLength must be one 64-bit word");
+
     class PathTable {
       friend class ::zblossom::PathTableTester;
       friend class ::TestPathTableFixture;
@@ -194,8 +212,8 @@ namespace zblossom {
 
       // Invoked when Resetting Alternating Forest.
       void ResetPathTable() {
-        // thrust::fill(offset_length_.begin(), offset_length_.end(), DPair<index_t, size_t>(0, 0));
-        offset_length_.Fill(DPair<index_t, size_t>(0, 0));
+        // thrust::fill(offset_length_.begin(), offset_length_.end(), OffsetLength{0, 0});
+        offset_length_.Fill(OffsetLength{0, 0});
         // thrust::fill(root_distance_.begin(), root_distance_.end(), 0);
         root_distance_.Fill(0);
 
@@ -212,6 +230,16 @@ namespace zblossom {
         paths_.Clear();
       }
 
+      // Occupancy (host side): path segments written so far, blossom-buffer
+      // nodes written in the current step, and the capacity of each buffer
+      size_t PathsUsed() const { return paths_.size(); }
+      void BlossomBufferToHost(std::vector<index_t> &out) const { // diagnostics (XB_DUMP_BLOSSOMS)
+        out.resize(blossom_buffer_.size());
+        thrust::copy_n(blossom_buffer_.begin(), out.size(), out.begin());
+      }
+      size_t BlossomBufferUsed() const { return blossom_buffer_.size(); }
+      size_t BufferCapacity() const { return path_buffer_size_; }
+
       // defined after the PathTable class
       PathTableView DeviceView();
 
@@ -220,7 +248,7 @@ namespace zblossom {
 
       size_t path_buffer_size_;
       // Store (offset, length) pair for paths either to the last even node or blossom base
-      DArray<DPair<index_t, size_t> > offset_length_;
+      DArray<OffsetLength > offset_length_;
       // length from a node to the root of its alternating tree: helpful when reconstructing a path
       DArray<index_t> root_distance_;
 
@@ -233,7 +261,7 @@ namespace zblossom {
       DEV_HOST_INLINE
       explicit PathTableView(size_t nnnodes,
                              size_t path_buffer_size,
-                             DArrayView<DPair<index_t, size_t> > paths_offset_length,
+                             DArrayView<OffsetLength > paths_offset_length,
                              DArrayView<index_t> paths_root_distance,
                              DListView<index_t> paths,
                              DListView<index_t> path_buffer
@@ -250,8 +278,42 @@ namespace zblossom {
           blossom_buffer_(path_buffer) {
       }
 
+      // Reads of segments and depths. In the nested blossom phase
+      // (XB_BLOSSOM_FLAT 0) other workers publish them during this kernel, so
+      // the reads bypass the per-SM L1, which is not coherent (a plain load
+      // could return a stale line); flat XB++ only reads what earlier kernels
+      // wrote and keeps the plain, cacheable loads.
+#if XB_BLOSSOM_FLAT
+      DEV_INLINE index_t LoadPath(size_t i) const { return paths_[i]; }
+      DEV_INLINE index_t LoadRootDistance(index_t x) const { return root_distance_[x]; }
+#else
+      DEV_INLINE index_t LoadPath(size_t i) const { return __ldcg(&paths_[i]); }
+      DEV_INLINE index_t LoadRootDistance(index_t x) const { return __ldcg(&root_distance_[x]); }
+#endif
+
+      // One 64-bit load / store of a node's (offset, length); see OffsetLength
+      DEV_INLINE OffsetLength LoadOL(index_t x) const {
+        union { unsigned long long u; OffsetLength p; } w;
+#if XB_BLOSSOM_FLAT
+        w.u = *reinterpret_cast<const unsigned long long *>(&offset_length_[x]);
+#else
+        w.u = *reinterpret_cast<const volatile unsigned long long *>(&offset_length_[x]);
+#endif
+        return w.p;
+      }
+
+      static DEV_INLINE OffsetLength MakeOL(size_t offset, size_t length) {
+        return OffsetLength{static_cast<index_t>(offset), static_cast<index_t>(length)};
+      }
+
+      DEV_INLINE void StoreOL(index_t x, OffsetLength p) {
+        union { unsigned long long u; OffsetLength p; } w;
+        w.p = p;
+        *reinterpret_cast<volatile unsigned long long *>(&offset_length_[x]) = w.u;
+      }
+
       DEV_INLINE bool IsPathEmpty(index_t v) const {
-        DPair<index_t, size_t> offset_length_pair = offset_length_[v];
+        OffsetLength offset_length_pair = LoadOL(v);
         return offset_length_pair.second == 0;
       }
 
@@ -264,12 +326,12 @@ namespace zblossom {
         paths_[offset] = w;
         paths_[offset + 1] = v;
 
-        // root_distance_[x] = TWO_NODES + root_distance_[v];
-        atomicExch(&root_distance_[x], TWO_NODES + root_distance_[v]);
+        // root_distance_[x] = TWO_NODES + LoadRootDistance(v);
+        atomicExch(&root_distance_[x], TWO_NODES + LoadRootDistance(v));
 
         __threadfence(); // <- make the list visible before meta‑data
 
-        offset_length_[x] = {offset, TWO_NODES};
+        StoreOL(x, MakeOL(offset, TWO_NODES));
         __threadfence(); // <- make the list visible before meta‑data
       }
 
@@ -284,7 +346,7 @@ namespace zblossom {
 
         // Traverse the augmenting path starting from v
         index_t cur_v = v;
-        DPair<index_t, size_t> offset_length = offset_length_[cur_v];
+        OffsetLength offset_length = LoadOL(cur_v);
 
         while (offset_length.second != 0) {
           index_t offset = offset_length.first;
@@ -292,8 +354,8 @@ namespace zblossom {
 
           // Iterate over pairs of nodes along the augmenting path and update their matchings
           for (index_t i = 0; i < length; i += 2) {
-            index_t node1 = paths_[offset + i];
-            index_t node2 = paths_[offset + i + 1];
+            index_t node1 = LoadPath(offset + i);
+            index_t node2 = LoadPath(offset + i + 1);
             // matching[node1] = node2;
             // matching[node2] = node1;
             atomicExch(&matching[node1], node2);
@@ -301,13 +363,13 @@ namespace zblossom {
           }
 
           // update the cur_v
-          cur_v = paths_[offset + length - 1];
-          offset_length = offset_length_[cur_v];
+          cur_v = LoadPath(offset + length - 1);
+          offset_length = LoadOL(cur_v);
         }
 
         // Do similar traversal for w
         index_t cur_w = w;
-        offset_length = offset_length_[cur_w];
+        offset_length = LoadOL(cur_w);
 
         while (offset_length.second != 0) {
           index_t offset = offset_length.first;
@@ -315,8 +377,8 @@ namespace zblossom {
 
           // Iterate ower pairs of nodes along the augmenting path and update their matchings
           for (index_t i = 0; i < length; i += 2) {
-            index_t node1 = paths_[offset + i];
-            index_t node2 = paths_[offset + i + 1];
+            index_t node1 = LoadPath(offset + i);
+            index_t node2 = LoadPath(offset + i + 1);
             // matching[node1] = node2;
             // matching[node2] = node1;
             atomicExch(&matching[node1], node2);
@@ -324,8 +386,8 @@ namespace zblossom {
           }
 
           // update the cur_w
-          cur_w = paths_[offset + length - 1];
-          offset_length = offset_length_[cur_w];
+          cur_w = LoadPath(offset + length - 1);
+          offset_length = LoadOL(cur_w);
         }
         __threadfence();
       }
@@ -336,8 +398,8 @@ namespace zblossom {
                                   size_t &nnodes_in_blossom,
                                   index_t &v_idx_in_blossom) {
         // 1-1 Get length of path v and path w using paths_root_length
-        size_t nnodes_v_root = this->root_distance_[v] + 1;
-        size_t nndoes_w_root = this->root_distance_[w] + 1;
+        size_t nnodes_v_root = this->LoadRootDistance(v) + 1;
+        size_t nndoes_w_root = this->LoadRootDistance(w) + 1;
 
         // 1-2 Resevere space for both path v and path w
         index_t path_v_offset = paths_.Reserve(nnodes_v_root + nndoes_w_root);
@@ -356,19 +418,19 @@ namespace zblossom {
 
         paths_[buffer_idx_v++] = cur_v;
 
-        DPair<index_t, size_t> offset_length = offset_length_[cur_v];
+        OffsetLength offset_length = LoadOL(cur_v);
         while (offset_length.second != 0) {
           index_t cur_offset = offset_length.first;
           size_t cur_length = offset_length.second;
 
           // Iterate each node in path
           for (index_t i = 0; i < cur_length; i++) {
-            paths_[buffer_idx_v++] = paths_[cur_offset + i];
+            paths_[buffer_idx_v++] = LoadPath(cur_offset + i);
           }
 
           // update the cur_v
-          cur_v = paths_[cur_offset + cur_length - 1];
-          offset_length = offset_length_[cur_v];
+          cur_v = LoadPath(cur_offset + cur_length - 1);
+          offset_length = LoadOL(cur_v);
         }
 
         index_t buffer_idx_v_end = buffer_idx_v;
@@ -378,19 +440,19 @@ namespace zblossom {
         index_t cur_w = w;
         // add w to path buffer
         paths_[buffer_idx_w++] = cur_w;
-        offset_length = offset_length_[cur_w];
+        offset_length = LoadOL(cur_w);
         while (offset_length.second > 0) {
           index_t cur_offset = offset_length.first;
           size_t cur_length = offset_length.second;
 
           // Iterate each node in path
           for (index_t i = 0; i < cur_length; i++) {
-            paths_[buffer_idx_w++] = paths_[cur_offset + i];
+            paths_[buffer_idx_w++] = LoadPath(cur_offset + i);
           }
 
           // update the cur_w
-          cur_w = paths_[cur_offset + cur_length - 1];
-          offset_length = offset_length_[cur_w];
+          cur_w = LoadPath(cur_offset + cur_length - 1);
+          offset_length = LoadOL(cur_w);
         }
 
         index_t buffer_idx_w_end = buffer_idx_w;
@@ -403,7 +465,7 @@ namespace zblossom {
 
         while (cur_buffer_v_idx >= path_v_offset &&
                cur_buffer_w_idx >= path_w_offset &&
-               paths_[cur_buffer_v_idx] == paths_[cur_buffer_w_idx]) {
+               LoadPath(cur_buffer_v_idx) == LoadPath(cur_buffer_w_idx)) {
           cur_buffer_v_idx--;
           cur_buffer_w_idx--;
         }
@@ -420,8 +482,8 @@ namespace zblossom {
         index_t left = path_v_offset;
         index_t right = base_idx_v;
         while (left < right) {
-          index_t tmp = paths_[left];
-          paths_[left++] = paths_[right];
+          index_t tmp = LoadPath(left);
+          paths_[left++] = LoadPath(right);
           paths_[right--] = tmp;
         }
 
@@ -429,7 +491,7 @@ namespace zblossom {
         v_idx_in_blossom = nnodes_v_base - 1;
 
         for (index_t i = 0; i < nnodes_w_base; i++) {
-          paths_[path_v_offset + nnodes_v_base + i] = paths_[path_w_offset + i];
+          paths_[path_v_offset + nnodes_v_base + i] = LoadPath(path_w_offset + i);
         }
 
         // 3-3 Update Blossom offset and length
@@ -437,7 +499,13 @@ namespace zblossom {
         nnodes_in_blossom = nnodes_v_base + nnodes_w_base;
       }
 
-      DEV_INLINE void FindBlossomInBlossomBuffer(index_t v,
+      // The original (pre-flattening) blossom finder: materialises v's and w's
+      // whole paths to the root in the blossom buffer, finds the base as the
+      // first divergence, then rearranges them into the cycle base..v, w..base
+      // (the same layout the anchor-node finder writes). Returns false when a
+      // walk runs past what root_distance reserved or the two paths do not
+      // meet (the forest changed under this worker, nested mode).
+      DEV_INLINE bool FindBlossomInBlossomBuffer(index_t v,
 
                                                  index_t w,
                                                  index_t &blossom_offset,
@@ -445,8 +513,8 @@ namespace zblossom {
                                                  index_t &v_idx_in_blossom,
                                                  index_t &w_idx_in_blossom) {
         // 1-1 Get length of path v and path w using paths_root_length
-        size_t nnnodes_v_root = this->root_distance_[v] + 1;
-        size_t nnode_w_root = this->root_distance_[w] + 1;
+        size_t nnnodes_v_root = this->LoadRootDistance(v) + 1;
+        size_t nnode_w_root = this->LoadRootDistance(w) + 1;
 
         // 1-2 Resevere space for both path v and path w
         // index_t path_v_offset = atomicAdd(blossom_buffer_offset_.Addr(), path_v_len + path_w_len);
@@ -466,24 +534,23 @@ namespace zblossom {
 
         blossom_buffer_[buffer_idx_v++] = cur_v;
 
-        DPair<index_t, size_t> offset_length = offset_length_[cur_v];
-        int it = 0;
+        OffsetLength offset_length = LoadOL(cur_v);
         while (offset_length.second != 0) {
           index_t cur_offset = offset_length.first;
           size_t cur_length = offset_length.second;
 
+          // longer than root_distance said: the tree changed under this worker
+          if (buffer_idx_v + static_cast<index_t>(cur_length) > path_w_offset) {
+            return false;
+          }
           // Iterate each node in path
           for (index_t i = 0; i < cur_length; i++) {
-            blossom_buffer_[buffer_idx_v++] = paths_[cur_offset + i];
+            blossom_buffer_[buffer_idx_v++] = LoadPath(cur_offset + i);
           }
 
           // update the cur_v
-          cur_v = paths_[cur_offset + cur_length - 1];
-          offset_length = offset_length_[cur_v];
-          it++;
-          if (it > 10000) {
-            printf("Dead Loop\n");
-          }
+          cur_v = LoadPath(cur_offset + cur_length - 1);
+          offset_length = LoadOL(cur_v);
         }
 
         // 1-4 Traverse path w to root and store it in paths_buffer
@@ -491,26 +558,30 @@ namespace zblossom {
         index_t cur_w = w;
         // add w to path buffer
         blossom_buffer_[buffer_idx_w++] = cur_w;
-        offset_length = offset_length_[cur_w];
+        offset_length = LoadOL(cur_w);
 
-        it = 0;
+        const index_t path_w_end = path_w_offset + static_cast<index_t>(nnode_w_root);
         while (offset_length.second > 0) {
           index_t cur_offset = offset_length.first;
           size_t cur_length = offset_length.second;
 
+          // longer than root_distance said: the tree changed under this worker
+          if (buffer_idx_w + static_cast<index_t>(cur_length) > path_w_end) {
+            return false;
+          }
           // Iterate each node in path
           for (index_t i = 0; i < cur_length; i++) {
-            blossom_buffer_[buffer_idx_w++] = paths_[cur_offset + i];
+            blossom_buffer_[buffer_idx_w++] = LoadPath(cur_offset + i);
           }
 
           // update the cur_w
-          cur_w = paths_[cur_offset + cur_length - 1];
-          offset_length = offset_length_[cur_w];
-
-          it++;
-          if (it > 10000) {
-            printf("Dead Loop\n");
-          }
+          cur_w = LoadPath(cur_offset + cur_length - 1);
+          offset_length = LoadOL(cur_w);
+        }
+        // both walks must have ended at the same root, or the paths do not share a base
+        if (buffer_idx_v != path_w_offset || buffer_idx_w != path_w_end ||
+            blossom_buffer_[path_w_offset - 1] != blossom_buffer_[path_w_end - 1]) {
+          return false;
         }
 
         // 2. Find the blossom base
@@ -552,6 +623,7 @@ namespace zblossom {
 
         v_idx_in_blossom = nnnodes_v_base - 1;
         w_idx_in_blossom = nnnodes_v_base;
+        return true;
       }
 
       DEV_INLINE void FindAndAddBlossomImplicit(index_t v,
@@ -572,8 +644,8 @@ namespace zblossom {
         size_t len_v_to_root = 0;
         size_t len_w_to_root = 0;
 
-        DPair<index_t, size_t> offset_length_cur_v = this->offset_length_[cur_v];
-        DPair<index_t, size_t> offset_length_cur_w = this->offset_length_[cur_w];
+        OffsetLength offset_length_cur_v = LoadOL(cur_v);
+        OffsetLength offset_length_cur_w = LoadOL(cur_w);
 
         index_t idx_in_path_v = 1;
         index_t idx_in_path_w = 1;
@@ -585,17 +657,17 @@ namespace zblossom {
             // cur_v reach the root node, switch to w
             reach_root_v = 1;
             cur_v = w;
-            offset_length_cur_v = this->offset_length_[cur_v];
+            offset_length_cur_v = LoadOL(cur_v);
             idx_in_path_v = 1;
           } else {
             // move to the next node in the path
-            cur_v = paths_[offset_length_cur_v.first + idx_in_path_v];
+            cur_v = LoadPath(offset_length_cur_v.first + idx_in_path_v);
 
             len_traversal_v += 2;
             len_v_to_root += 2 * (1 - reach_root_v);
 
             if (idx_in_path_v == offset_length_cur_v.second - 1) {
-              offset_length_cur_v = this->offset_length_[cur_v];
+              offset_length_cur_v = LoadOL(cur_v);
               idx_in_path_v = 1;
             } else {
               idx_in_path_v += 2;
@@ -606,18 +678,18 @@ namespace zblossom {
             // cur_v reach the root node, switch to w
             reach_root_w = 1;
             cur_w = v;
-            offset_length_cur_w = this->offset_length_[cur_w];
+            offset_length_cur_w = LoadOL(cur_w);
             idx_in_path_w = 1;
           } else {
             // move to the next node in the path
-            cur_w = paths_[offset_length_cur_w.first + idx_in_path_w];
+            cur_w = LoadPath(offset_length_cur_w.first + idx_in_path_w);
 
             len_traversal_w += 2;
             len_w_to_root += 2 * (1 - reach_root_w);
 
             // if the cur_v is already the last one in the path
             if (idx_in_path_w == offset_length_cur_w.second - 1) {
-              offset_length_cur_w = this->offset_length_[cur_w];
+              offset_length_cur_w = LoadOL(cur_w);
               idx_in_path_w = 1;
             } else {
               idx_in_path_w += 2;
@@ -648,13 +720,13 @@ namespace zblossom {
 
         index_t last_v = v;
         this->paths_[buffer_idx_v--] = v;
-        offset_length_cur_v = this->offset_length_[v];
+        offset_length_cur_v = LoadOL(v);
         idx_in_path_v = 0;
         while (last_v != blossom_base) {
-          index_t cur_v_to_add = paths_[offset_length_cur_v.first + idx_in_path_v];
+          index_t cur_v_to_add = LoadPath(offset_length_cur_v.first + idx_in_path_v);
           this->paths_[buffer_idx_v--] = cur_v_to_add;
           if (idx_in_path_v == offset_length_cur_v.second - 1) {
-            offset_length_cur_v = this->offset_length_[cur_v_to_add];
+            offset_length_cur_v = LoadOL(cur_v_to_add);
             idx_in_path_v = 0;
           } else {
             idx_in_path_v += 1;
@@ -666,14 +738,14 @@ namespace zblossom {
         index_t buffer_idx_w = blossom_offset + nnodes_v_to_base;
         // add w to path buffer
         this->paths_[buffer_idx_w++] = w;
-        offset_length_cur_w = this->offset_length_[w];
+        offset_length_cur_w = LoadOL(w);
         index_t last_w = w;
         idx_in_path_w = 0;
         while (last_w != blossom_base) {
-          index_t cur_w_to_add = paths_[offset_length_cur_w.first + idx_in_path_w];
+          index_t cur_w_to_add = LoadPath(offset_length_cur_w.first + idx_in_path_w);
           this->paths_[buffer_idx_w++] = cur_w_to_add;
           if (idx_in_path_w == offset_length_cur_w.second - 1) {
-            offset_length_cur_w = this->offset_length_[cur_w_to_add];
+            offset_length_cur_w = LoadOL(cur_w_to_add);
             idx_in_path_w = 0;
           } else {
             idx_in_path_w += 1;
@@ -693,37 +765,37 @@ namespace zblossom {
         index_t cur_v = v;
         index_t cur_w = w;
 
-        DPair<index_t, size_t> offset_length_cur_v = this->offset_length_[cur_v];
-        DPair<index_t, size_t> offset_length_cur_w = this->offset_length_[cur_w];
+        OffsetLength offset_length_cur_v = LoadOL(cur_v);
+        OffsetLength offset_length_cur_w = LoadOL(cur_w);
 
         int it = 0;
         while (cur_v != cur_w) {
           if (offset_length_cur_v.second == 0) {
             // cur_v reach the root node, switch to w
             cur_v = w;
-            offset_length_cur_v = this->offset_length_[cur_v];
+            offset_length_cur_v = LoadOL(cur_v);
           } else {
             // move to the next node in the path
-            cur_v = paths_[offset_length_cur_v.first + offset_length_cur_v.second - 1];
-            offset_length_cur_v = this->offset_length_[cur_v];
+            cur_v = LoadPath(offset_length_cur_v.first + offset_length_cur_v.second - 1);
+            offset_length_cur_v = LoadOL(cur_v);
           }
 
           if (offset_length_cur_w.second == 0) {
             // cur_v reach the root node, switch to w
             cur_w = v;
-            offset_length_cur_w = this->offset_length_[cur_w];
+            offset_length_cur_w = LoadOL(cur_w);
           } else {
             // move to the next node in the path
-            cur_w = paths_[offset_length_cur_w.first + offset_length_cur_w.second - 1];
-            offset_length_cur_w = this->offset_length_[cur_w];
+            cur_w = LoadPath(offset_length_cur_w.first + offset_length_cur_w.second - 1);
+            offset_length_cur_w = LoadOL(cur_w);
           }
         }
 
         index_t blossom_base = cur_v;
         // reserve space in paths to store the blossom from base to v to w to base
 
-        size_t len_v_to_base = root_distance_[v] - root_distance_[blossom_base];
-        size_t len_w_to_base = root_distance_[w] - root_distance_[blossom_base];
+        size_t len_v_to_base = LoadRootDistance(v) - LoadRootDistance(blossom_base);
+        size_t len_w_to_base = LoadRootDistance(w) - LoadRootDistance(blossom_base);
 
         size_t nnodes_v_to_base = len_v_to_base + 1;
         size_t nnodes_w_to_base = len_w_to_base + 1;
@@ -741,13 +813,13 @@ namespace zblossom {
 
         index_t last_v = v;
         this->paths_[buffer_idx_v--] = v;
-        offset_length_cur_v = this->offset_length_[v];
+        offset_length_cur_v = LoadOL(v);
         index_t idx_in_path_v = 0;
         while (last_v != blossom_base) {
-          index_t cur_v_to_add = paths_[offset_length_cur_v.first + idx_in_path_v];
+          index_t cur_v_to_add = LoadPath(offset_length_cur_v.first + idx_in_path_v);
           this->paths_[buffer_idx_v--] = cur_v_to_add;
           if (idx_in_path_v == offset_length_cur_v.second - 1) {
-            offset_length_cur_v = this->offset_length_[cur_v_to_add];
+            offset_length_cur_v = LoadOL(cur_v_to_add);
             idx_in_path_v = 0;
           } else {
             idx_in_path_v += 1;
@@ -759,14 +831,14 @@ namespace zblossom {
         index_t buffer_idx_w = blossom_offset + nnodes_v_to_base;
         // add w to path buffer
         this->paths_[buffer_idx_w++] = w;
-        offset_length_cur_w = this->offset_length_[w];
+        offset_length_cur_w = LoadOL(w);
         index_t last_w = w;
         index_t idx_in_path_w = 0;
         while (last_w != blossom_base) {
-          index_t cur_w_to_add = paths_[offset_length_cur_w.first + idx_in_path_w];
+          index_t cur_w_to_add = LoadPath(offset_length_cur_w.first + idx_in_path_w);
           this->paths_[buffer_idx_w++] = cur_w_to_add;
           if (idx_in_path_w == offset_length_cur_w.second - 1) {
-            offset_length_cur_w = this->offset_length_[cur_w_to_add];
+            offset_length_cur_w = LoadOL(cur_w_to_add);
             idx_in_path_w = 0;
           } else {
             idx_in_path_w += 1;
@@ -777,46 +849,61 @@ namespace zblossom {
         v_idx_in_blossom = nnodes_v_to_base - 1;
       }
 
-      DEV_INLINE void FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(index_t v,
+      // Writes the blossom's cycle base..v, w..base into the blossom buffer.
+      // Returns false (nothing usable written) when the walk does not
+      // converge: the forest changed under this worker (the nested blossom
+      // phase, XB_BLOSSOM_FLAT 0, transforms odd nodes in the same kernel),
+      // the same bail-out as the CPU findBlossom's consistent_flag.
+      DEV_INLINE bool FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(index_t v,
                                                             index_t w,
                                                             index_t &blossom_offset,
                                                             size_t &num_nodes_in_blossom,
-                                                            index_t &v_idx_in_blossom) {
+                                                            index_t &v_idx_in_blossom,
+                                                            size_t *walk_steps = nullptr) {
         // find the blossom base
         index_t cur_v = v;
         index_t cur_w = w;
 
-        DPair<index_t, size_t> offset_length_cur_v = this->offset_length_[cur_v];
-        DPair<index_t, size_t> offset_length_cur_w = this->offset_length_[cur_w];
+        OffsetLength offset_length_cur_v = LoadOL(cur_v);
+        OffsetLength offset_length_cur_w = LoadOL(cur_w);
 
-        int it = 0;
+        // In a consistent forest the two pointers meet within the two depths
+        // (each walks its own side to the root, switches once, then the other
+        // side up to the base); more steps mean the forest changed under us
+        size_t max_steps = static_cast<size_t>(this->LoadRootDistance(v)) + this->LoadRootDistance(w) + 4;
+        if (max_steps > this->nnnodes_) max_steps = this->nnnodes_;
+        size_t it = 0;
         while (cur_v != cur_w) {
+          if (++it > max_steps) {
+            return false;
+          }
           if (offset_length_cur_v.second == 0) {
             // cur_v reach the root node, switch to w
             cur_v = w;
-            offset_length_cur_v = this->offset_length_[cur_v];
+            offset_length_cur_v = LoadOL(cur_v);
           } else {
             // move to the next node in the path
-            cur_v = paths_[offset_length_cur_v.first + offset_length_cur_v.second - 1];
-            offset_length_cur_v = this->offset_length_[cur_v];
+            cur_v = LoadPath(offset_length_cur_v.first + offset_length_cur_v.second - 1);
+            offset_length_cur_v = LoadOL(cur_v);
           }
 
           if (offset_length_cur_w.second == 0) {
             // cur_v reach the root node, switch to w
             cur_w = v;
-            offset_length_cur_w = this->offset_length_[cur_w];
+            offset_length_cur_w = LoadOL(cur_w);
           } else {
             // move to the next node in the path
-            cur_w = paths_[offset_length_cur_w.first + offset_length_cur_w.second - 1];
-            offset_length_cur_w = this->offset_length_[cur_w];
+            cur_w = LoadPath(offset_length_cur_w.first + offset_length_cur_w.second - 1);
+            offset_length_cur_w = LoadOL(cur_w);
           }
         }
 
         index_t blossom_base = cur_v;
+        if (walk_steps != nullptr) *walk_steps = it; // counters: the base walk's length
         // reserve space in paths to store the blossom from base to v to w to base
 
-        size_t len_v_to_base = root_distance_[v] - root_distance_[blossom_base];
-        size_t len_w_to_base = root_distance_[w] - root_distance_[blossom_base];
+        size_t len_v_to_base = LoadRootDistance(v) - LoadRootDistance(blossom_base);
+        size_t len_w_to_base = LoadRootDistance(w) - LoadRootDistance(blossom_base);
 
         size_t nnodes_v_to_base = len_v_to_base + 1;
         size_t nnodes_w_to_base = len_w_to_base + 1;
@@ -834,13 +921,16 @@ namespace zblossom {
 
         index_t last_v = v;
         this->blossom_buffer_[buffer_idx_v--] = v;
-        offset_length_cur_v = this->offset_length_[v];
+        offset_length_cur_v = LoadOL(v);
         index_t idx_in_path_v = 0;
         while (last_v != blossom_base) {
-          index_t cur_v_to_add = paths_[offset_length_cur_v.first + idx_in_path_v];
+          if (buffer_idx_v < blossom_offset) {
+            return false; // longer than root_distance said: the tree changed
+          }
+          index_t cur_v_to_add = LoadPath(offset_length_cur_v.first + idx_in_path_v);
           this->blossom_buffer_[buffer_idx_v--] = cur_v_to_add;
           if (idx_in_path_v == offset_length_cur_v.second - 1) {
-            offset_length_cur_v = this->offset_length_[cur_v_to_add];
+            offset_length_cur_v = LoadOL(cur_v_to_add);
             idx_in_path_v = 0;
           } else {
             idx_in_path_v += 1;
@@ -852,14 +942,17 @@ namespace zblossom {
         index_t buffer_idx_w = blossom_offset + nnodes_v_to_base;
         // add w to path buffer
         this->blossom_buffer_[buffer_idx_w++] = w;
-        offset_length_cur_w = this->offset_length_[w];
+        offset_length_cur_w = LoadOL(w);
         index_t last_w = w;
         index_t idx_in_path_w = 0;
         while (last_w != blossom_base) {
-          index_t cur_w_to_add = paths_[offset_length_cur_w.first + idx_in_path_w];
+          if (buffer_idx_w >= blossom_offset + static_cast<index_t>(num_nodes_in_blossom)) {
+            return false; // longer than root_distance said: the tree changed
+          }
+          index_t cur_w_to_add = LoadPath(offset_length_cur_w.first + idx_in_path_w);
           this->blossom_buffer_[buffer_idx_w++] = cur_w_to_add;
           if (idx_in_path_w == offset_length_cur_w.second - 1) {
-            offset_length_cur_w = this->offset_length_[cur_w_to_add];
+            offset_length_cur_w = LoadOL(cur_w_to_add);
             idx_in_path_w = 0;
           } else {
             idx_in_path_w += 1;
@@ -868,6 +961,7 @@ namespace zblossom {
         }
 
         v_idx_in_blossom = nnodes_v_to_base - 1;
+        return true;
       }
 
       DEV_INLINE void FindBlossomBaseByAnchorNode(index_t v,
@@ -877,29 +971,29 @@ namespace zblossom {
         index_t cur_v = v;
         index_t cur_w = w;
 
-        DPair<index_t, size_t> offset_length_cur_v = this->offset_length_[cur_v];
-        DPair<index_t, size_t> offset_length_cur_w = this->offset_length_[cur_w];
+        OffsetLength offset_length_cur_v = LoadOL(cur_v);
+        OffsetLength offset_length_cur_w = LoadOL(cur_w);
 
         int it = 0;
         while (cur_v != cur_w) {
           if (offset_length_cur_v.second == 0) {
             // cur_v reach the root node, switch to w
             cur_v = w;
-            offset_length_cur_v = this->offset_length_[cur_v];
+            offset_length_cur_v = LoadOL(cur_v);
           } else {
             // move to the next node in the path
-            cur_v = paths_[offset_length_cur_v.first + offset_length_cur_v.second - 1];
-            offset_length_cur_v = this->offset_length_[cur_v];
+            cur_v = LoadPath(offset_length_cur_v.first + offset_length_cur_v.second - 1);
+            offset_length_cur_v = LoadOL(cur_v);
           }
 
           if (offset_length_cur_w.second == 0) {
             // cur_v reach the root node, switch to w
             cur_w = v;
-            offset_length_cur_w = this->offset_length_[cur_w];
+            offset_length_cur_w = LoadOL(cur_w);
           } else {
             // move to the next node in the path
-            cur_w = paths_[offset_length_cur_w.first + offset_length_cur_w.second - 1];
-            offset_length_cur_w = this->offset_length_[cur_w];
+            cur_w = LoadPath(offset_length_cur_w.first + offset_length_cur_w.second - 1);
+            offset_length_cur_w = LoadOL(cur_w);
           }
         }
 
@@ -913,8 +1007,8 @@ namespace zblossom {
                                        size_t &num_nodes_in_blossom) {
         // reserve space in paths to store the blossom from base to v to w to base
 
-        size_t len_v_to_base = root_distance_[v] - root_distance_[blossom_base];
-        size_t len_w_to_base = root_distance_[w] - root_distance_[blossom_base];
+        size_t len_v_to_base = LoadRootDistance(v) - LoadRootDistance(blossom_base);
+        size_t len_w_to_base = LoadRootDistance(w) - LoadRootDistance(blossom_base);
 
         size_t nnodes_v_to_base = len_v_to_base + 1;
         size_t nnodes_w_to_base = len_w_to_base + 1;
@@ -932,13 +1026,13 @@ namespace zblossom {
 
         index_t last_v = v;
         this->paths_[buffer_idx_v--] = v;
-        DPair<index_t, size_t> offset_length_cur_v = this->offset_length_[v];
+        OffsetLength offset_length_cur_v = LoadOL(v);
         index_t idx_in_path_v = 0;
         while (last_v != blossom_base) {
-          index_t cur_v_to_add = paths_[offset_length_cur_v.first + idx_in_path_v];
+          index_t cur_v_to_add = LoadPath(offset_length_cur_v.first + idx_in_path_v);
           this->paths_[buffer_idx_v--] = cur_v_to_add;
           if (idx_in_path_v == offset_length_cur_v.second - 1) {
-            offset_length_cur_v = this->offset_length_[cur_v_to_add];
+            offset_length_cur_v = LoadOL(cur_v_to_add);
             idx_in_path_v = 0;
           } else {
             idx_in_path_v += 1;
@@ -950,14 +1044,14 @@ namespace zblossom {
         index_t buffer_idx_w = blossom_offset + nnodes_v_to_base;
         // add w to path buffer
         this->paths_[buffer_idx_w++] = w;
-        DPair<index_t, size_t> offset_length_cur_w = this->offset_length_[w];
+        OffsetLength offset_length_cur_w = LoadOL(w);
         index_t last_w = w;
         index_t idx_in_path_w = 0;
         while (last_w != blossom_base) {
-          index_t cur_w_to_add = paths_[offset_length_cur_w.first + idx_in_path_w];
+          index_t cur_w_to_add = LoadPath(offset_length_cur_w.first + idx_in_path_w);
           this->paths_[buffer_idx_w++] = cur_w_to_add;
           if (idx_in_path_w == offset_length_cur_w.second - 1) {
-            offset_length_cur_w = this->offset_length_[cur_w_to_add];
+            offset_length_cur_w = LoadOL(cur_w_to_add);
             idx_in_path_w = 0;
           } else {
             idx_in_path_w += 1;
@@ -968,16 +1062,16 @@ namespace zblossom {
         __threadfence();
         // size_t nnodes_in_buffer_w = 1;
         // while (nnodes_in_buffer_w < nnodes_w_to_base) {
-        //   DPair<index_t, size_t> offset_length_w = offset_length_[cur_w];
+        //   OffsetLength offset_length_w = LoadOL(cur_w);
         //   index_t offset = offset_length_w.first;
         //   size_t length = offset_length_w.second;
         //
         //   for (index_t i = 0; i < length; i++) {
-        //     this->paths_[buffer_idx_w++] = paths_[offset + i];
+        //     this->paths_[buffer_idx_w++] = LoadPath(offset + i);
         //   }
         //
         //   nnodes_in_buffer_w += length;
-        //   cur_w = paths_[offset + length - 1];
+        //   cur_w = LoadPath(offset + length - 1);
         // }
 
         // v_idx_in_blossom = nnodes_v_to_base - 1;
@@ -989,12 +1083,12 @@ namespace zblossom {
                                                       index_t path_offset,
                                                       index_t path_len) {
         // only root_distance and offset_length are updated
-        // this->root_distance_[node] = path_len + this->root_distance_[blossom_base];
-        atomicExch(&this->root_distance_[node], path_len + this->root_distance_[blossom_base]);
+        // this->root_distance_[node] = path_len + this->LoadRootDistance(blossom_base);
+        atomicExch(&this->root_distance_[node], path_len + this->LoadRootDistance(blossom_base));
 
         __threadfence(); // <- make the list visible before meta‑data
 
-        offset_length_[node] = {path_offset, path_len};
+        StoreOL(node, MakeOL(path_offset, path_len));
 
         __threadfence(); // <- make the list visible before meta‑data
       }
@@ -1026,11 +1120,11 @@ namespace zblossom {
 
         // 2. update root length
         index_t base = this->blossom_buffer_[blossom_offset + blossom_length - 1];
-        this->root_distance_[node] = path_len + this->root_distance_[base];
+        this->root_distance_[node] = path_len + this->LoadRootDistance(base);
 
         __threadfence();
 
-        offset_length_[node] = {path_offset, path_len};
+        StoreOL(node, MakeOL(path_offset, path_len));
         __threadfence();
       }
 
@@ -1047,7 +1141,7 @@ namespace zblossom {
 
         // 2. update root length
         index_t base = this->blossom_buffer_[blossom_offset + 0];
-        this->root_distance_[node] = path_len + this->root_distance_[base];
+        this->root_distance_[node] = path_len + this->LoadRootDistance(base);
 
         // 3. expands nodes (current node to base) to paths
         for (index_t i = 0; i < path_len; i++) {
@@ -1056,7 +1150,7 @@ namespace zblossom {
 
         __threadfence(); // <- make the list visible before meta‑data
 
-        offset_length_[node] = {path_offset, path_len};
+        StoreOL(node, MakeOL(path_offset, path_len));
 
         __threadfence(); // <- make the list visible before meta‑data
       }
@@ -1072,7 +1166,7 @@ namespace zblossom {
 
         // Choose base and set root distance
         index_t base = this->blossom_buffer_[blossom_offset + (step > 0 ? (blossom_len - 1) : 0)];
-        this->root_distance_[node] = path_len + this->root_distance_[base];
+        this->root_distance_[node] = path_len + this->LoadRootDistance(base);
 
         // Materialize nodes into paths_
         index_t start = blossom_offset + start_idx;
@@ -1081,7 +1175,7 @@ namespace zblossom {
         }
 
         __threadfence();
-        offset_length_[node] = {path_offset, path_len};
+        StoreOL(node, MakeOL(path_offset, path_len));
         __threadfence();
       }
 
@@ -1092,14 +1186,14 @@ namespace zblossom {
                                                             index_t v_idx) {
         for (int i = 1; i < v_idx; i += 2) {
           if (this->IsPathEmpty(i)) {
-            index_t node = this->paths_[blossom_offset + i];
+            index_t node = this->LoadPath(blossom_offset + i);
 
             // bug fixed: offset = blossom_offset + i + 1, the node right after it, not itself
             index_t offset = blossom_offset + i + 1;
             // (blossom length - 1) - i + 1 (- 1) (exclude node itself)
             size_t length = nnodes_in_blossom - static_cast<size_t>(i) - 1;
 
-            index_t blossom_base = this->paths_[blossom_offset];
+            index_t blossom_base = this->LoadPath(blossom_offset);
 
             this->ExpandNodesFromBlossomReusePath(node, blossom_base, offset, length);
 
@@ -1114,15 +1208,15 @@ namespace zblossom {
       }
 
       DEV_INLINE index_t GetNodeFromBlossom(index_t blossom_offset, index_t idx) {
-        return this->paths_[blossom_offset + idx];
+        return this->LoadPath(blossom_offset + idx);
       }
 
       DEV_INLINE bool CheckDuplication(index_t path_offset, index_t path_len) {
         // Check for duplicates in blossom
         for (index_t i = path_offset; i < path_offset + path_len; i++) {
-          index_t node_i = paths_[i];
+          index_t node_i = LoadPath(i);
           for (index_t j = i + 1; j < path_offset + path_len; j++) {
-            if (node_i == paths_[j]) {
+            if (node_i == LoadPath(j)) {
               return true;
             }
           }
@@ -1189,33 +1283,96 @@ namespace zblossom {
         return false;
       }
 
+      // ---- Blossom phase without a blossom buffer (XB_BLOSSOM_MAT, nomat) ----
+      // "Chain" of even node s: s, then s's segment, then the segment of that
+      // segment's last node (the next even node), ... down to the root.
+
+      // How many nodes of s's chain come before u (s included)
+      DEV_INLINE size_t CountChainBefore(index_t s, index_t u) const {
+        size_t count = 0;
+        index_t cur = s;
+        while (true) {
+          count++; // cur
+          const OffsetLength ol = LoadOL(cur);
+          for (index_t i = 0; i + 1 < ol.second; i++) {
+            if (LoadPath(ol.first + i) == u) return count;
+            count++;
+          }
+          cur = LoadPath(ol.first + ol.second - 1);
+        }
+      }
+
+      // Odd node u, at position count_s of even node s's chain (the chain runs
+      // down to blossom base `base`), becomes even with the path around the
+      // cycle:  reverse(chain s..u, u excluded) + o + chain(o..base),
+      // read from the path table: the same nodes the blossom buffer's
+      // ExpandNodesFromBlossomDirectional copies for the odd node on s's side.
+      DEV_INLINE void ExpandOddNodeAroundBlossom(index_t u, index_t s, index_t o, index_t base, size_t count_s) {
+        const size_t len_o = LoadRootDistance(o) - LoadRootDistance(base); // o's chain, o excluded, base included
+        const size_t total = count_s + 1 + len_o;
+        const index_t off = paths_.Reserve(total);
+
+        // s's chain before u, reversed, into [0, count_s)
+        index_t pos = static_cast<index_t>(count_s);
+        index_t cur = s;
+        bool found = false;
+        while (!found) {
+          paths_[off + --pos] = cur;
+          const OffsetLength ol = LoadOL(cur);
+          for (index_t i = 0; i + 1 < ol.second; i++) {
+            const index_t n = LoadPath(ol.first + i);
+            if (n == u) {
+              found = true;
+              break;
+            }
+            paths_[off + --pos] = n;
+          }
+          if (!found) cur = LoadPath(ol.first + ol.second - 1);
+        }
+
+        // o, then o's chain down to the base
+        paths_[off + static_cast<index_t>(count_s)] = o;
+        index_t p = off + static_cast<index_t>(count_s) + 1;
+        cur = o;
+        while (cur != base) {
+          const OffsetLength ol = LoadOL(cur);
+          for (index_t i = 0; i < ol.second; i++) paths_[p++] = LoadPath(ol.first + i);
+          cur = LoadPath(ol.first + ol.second - 1);
+        }
+        __threadfence(); // the path before its metadata
+        atomicExch(&root_distance_[u], static_cast<index_t>(total) + LoadRootDistance(base));
+        __threadfence();
+        StoreOL(u, MakeOL(off, total));
+        __threadfence();
+      }
+
       // ===================== For ParAugPath() --- Transform Odd Nodes =============================
       // Same implementation as IsPathEmpty
       DEV_INLINE bool IsRoot(index_t v) const {
-        DPair<index_t, size_t> offset_length_pair = offset_length_[v];
+        OffsetLength offset_length_pair = LoadOL(v);
         return offset_length_pair.second == 0;
       }
 
       DEV_INLINE index_t GetRootDistance(index_t v) const {
-        return this->root_distance_[v];
+        return this->LoadRootDistance(v);
       }
 
-      DEV_INLINE DPair<index_t, size_t> GetOffsetLength(index_t v) const {
-        return this->offset_length_[v];
+      DEV_INLINE OffsetLength GetOffsetLength(index_t v) const {
+        return LoadOL(v);
       }
 
-      DEV_INLINE index_t GetAnchorNode(DPair<index_t, size_t> offset_length) const {
-        return this->paths_[offset_length.first + offset_length.second - 1];
+      DEV_INLINE index_t GetAnchorNode(OffsetLength offset_length) const {
+        return this->LoadPath(offset_length.first + offset_length.second - 1);
       }
 
       DEV_INLINE index_t GetNode(index_t offset, index_t idx_in_path) const {
-        return this->paths_[offset + idx_in_path];
+        return this->LoadPath(offset + idx_in_path);
       }
 
       DEV_INLINE void AddAugmentingPath(index_t v, DArrayView<index_t> matching) {
         // Traverse the augmenting path starting from v
         index_t cur_v = v;
-        DPair<index_t, size_t> offset_length = offset_length_[cur_v];
+        OffsetLength offset_length = LoadOL(cur_v);
 
         while (offset_length.second != 0) {
           index_t offset = offset_length.first;
@@ -1223,8 +1380,8 @@ namespace zblossom {
 
           // Iterate over pairs of nodes along the augmenting path and update their matchings
           for (index_t i = 0; i < length; i += 2) {
-            index_t node1 = paths_[offset + i];
-            index_t node2 = paths_[offset + i + 1];
+            index_t node1 = LoadPath(offset + i);
+            index_t node2 = LoadPath(offset + i + 1);
             // matching[node1] = node2;
             // matching[node2] = node1;
             atomicExch(&matching[node1], node2);
@@ -1232,8 +1389,8 @@ namespace zblossom {
           }
 
           // update the cur_v
-          cur_v = paths_[offset + length - 1];
-          offset_length = offset_length_[cur_v];
+          cur_v = LoadPath(offset + length - 1);
+          offset_length = LoadOL(cur_v);
         }
       }
 
@@ -1253,7 +1410,7 @@ namespace zblossom {
       DEV_INLINE void ResetNode(index_t node) {
         // reserve blossom offset
         root_distance_[node] = 0;
-        offset_length_[node] = {0, 0};
+        StoreOL(node, MakeOL(0, 0));
       }
 
     private
@@ -1262,7 +1419,7 @@ namespace zblossom {
       size_t path_buffer_size_;
 
       // Store (offset, length) pair for paths either to the last even node or blossom base
-      DArrayView<DPair<index_t, size_t> > offset_length_;
+      DArrayView<OffsetLength > offset_length_;
       // length from a node to the root of its alternating tree: helpful when reconstructing a path
       DArrayView<index_t> root_distance_;
       // Paths either to the last even node or blossom base
