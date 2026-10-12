@@ -66,6 +66,7 @@ __device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, f
   path_table.ForEachRecordedOddOnChain(s, base, [&](index_t n) {
     if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
       const offset_t t = task_node.Append(n);
+      if (static_cast<size_t>(t) >= task_node.capacity()) return; // the list is full; the host stops the run
       task_s[t] = s;
       task_o[t] = o;
       task_base[t] = base;
@@ -378,6 +379,16 @@ class engine_t {
     });
   }
 
+  // The blossom lists hold odd_node_ratio x n entries; the prefix sum over them
+  // needs one more. Past that the run is invalid: stop with an error.
+  void CheckListFits(size_t used, const char* what) const {
+    if (used + 1 > num_odd_nodes_in_blossom_list_.size()) {
+      std::fprintf(stderr, "XBError: blossom list full (%zu %ss, capacity %zu); raise -o\n", used, what,
+                   num_odd_nodes_in_blossom_list_.size() - 1);
+      std::exit(4);
+    }
+  }
+
   void TransformOddNodesInBlossom() {
     if (enode_queue_.Size() == 0) return;
     LoadFrontier();
@@ -422,6 +433,7 @@ class engine_t {
         return false;
       });
       const size_t num_tasks = blossom_offset_list_.size();
+      CheckListFits(num_tasks, "odd-node task");
       peak_list_ = std::max(peak_list_, num_tasks);
       if (num_tasks == 0) return;
       // one task per claimed odd node: its path around the cycle, from the path table
@@ -473,6 +485,7 @@ class engine_t {
         size_t num_odd = (nnodes_in_blossom - 2) >> 1;
         if (num_odd == 0) return false;
         offset_t slot = blossom_offsets.Append(blossom_offset);
+        if (static_cast<size_t>(slot) >= blossom_offsets.capacity()) return false; // full; the host stops the run
         nodes_in_blossom[slot] = nnodes_in_blossom;
         odd_in_blossom[slot] = num_odd;
         odd_vside_in_blossom[slot] = num_odd_vside;
@@ -481,6 +494,7 @@ class engine_t {
     });
 
     // Make their odd nodes even (one tasklet per odd node).
+    CheckListFits(blossom_offset_list_.size(), "closing-edge record");
     if (path_table_.CycleOverflow()) {
       std::fprintf(stderr, "XBError: cycle buffer full (%zu nodes); raise -p\n", path_table_.BufferCapacity());
       std::exit(4);

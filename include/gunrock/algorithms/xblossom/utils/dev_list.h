@@ -27,8 +27,9 @@ public:
 
   DEV_INLINE offset_t Append(T val) {
     auto idx = AtomicAdd(&counter_, 1);
-    assert(static_cast<size_t>(idx) < array_.size()); // list capacity exceeded
-    array_[idx] = val;
+    // past the capacity nothing is written; the counter keeps counting, so the
+    // host sees size() > capacity() and stops the run (no bounds check in release)
+    if (static_cast<size_t>(idx) < array_.size()) array_[idx] = val;
     return idx;
   }
 
