@@ -46,6 +46,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <chrono>
 
 namespace gunrock {
@@ -89,8 +90,9 @@ class engine_t {
  public:
   // nomat: no blossom buffer, odd nodes claimed while the closing edge walks
   // its chains and made even from the path table (X-Blossom++'s XB_BLOSSOM_MAT 1);
-  // odd_node_ratio sizes the blossom lists (records under mat, tasks under nomat).
-  engine_t(graph_t& G, size_t path_table_buffer_ratio, size_t odd_node_ratio, bool nomat,
+  // odd_node_ratio sizes the blossom lists (records under mat, tasks under nomat),
+  // in entries per node; it may be fractional (nomat needs well under one per node).
+  engine_t(graph_t& G, size_t path_table_buffer_ratio, double odd_node_ratio, bool nomat,
            std::shared_ptr<gcuda::multi_context_t> context)
       : G_(G),
         context_(context),
@@ -100,16 +102,15 @@ class engine_t {
         path_table_(nnodes_, path_table_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
         is_even_(nnodes_),
         tree_roots_(nnodes_),
-        blossom_to_base_(nnodes_),
         atomic_locks_tree_(nnodes_),
         atomic_locks_match_(nnodes_),
         atomic_locks_odd_nodes_(nnodes_),
         enode_queue_(nnodes_),
-        blossom_offset_list_(odd_node_ratio * nnodes_ + 1),
-        num_nodes_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
-        num_odd_nodes_vside_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
-        num_odd_nodes_in_blossom_list_(odd_node_ratio * nnodes_ + 1),
-        num_odd_nodes_in_blossom_psum_(odd_node_ratio * nnodes_ + 1),
+        blossom_offset_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_nodes_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_vside_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_in_blossom_list_(ListSize(odd_node_ratio, nnodes_)),
+        num_odd_nodes_in_blossom_psum_(nomat ? 1 : ListSize(odd_node_ratio, nnodes_)), // nomat scans nothing,
         input_frontier_(nnodes_),
         output_frontier_(1) {
     size_t bytes = 0;
@@ -120,6 +121,9 @@ class engine_t {
     scan_temp_.resize(bytes);
     scan_temp_bytes_ = bytes;
   }
+
+  // entries of a blossom list: ratio x n, rounded up, plus the one a prefix sum needs
+  static size_t ListSize(double ratio, size_t n) { return static_cast<size_t>(std::ceil(ratio * static_cast<double>(n))) + 1; }
 
   // Maximum matching from the empty matching; mate[v] == nnodes for exposed v.
   std::vector<index_t> FindMaximumMatch() {
@@ -171,7 +175,6 @@ class engine_t {
   path_table_t path_table_;
   DArray<DFlag> is_even_;
   DArray<index_t> tree_roots_;
-  DArray<index_t> blossom_to_base_;
   DArray<DAtomicFlag> atomic_locks_tree_;
   DArray<DAtomicFlag> atomic_locks_match_;
   DArray<DAtomicFlag> atomic_locks_odd_nodes_;

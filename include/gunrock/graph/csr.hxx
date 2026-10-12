@@ -215,6 +215,12 @@ class graph_csr_t {
     return number_of_edges;
   }
 
+  // Point the edge weights at other device memory of at least
+  // number_of_edges weights (e.g. the column indices of an unweighted graph):
+  // the advance operators load a weight per edge even when the operator
+  // ignores it, so an unweighted algorithm need not allocate them.
+  __host__ void alias_values(weight_type* v) { values = v; }
+
  protected:
   __host__ void set(
       gunrock::format::csr_t<space, vertex_t, edge_t, weight_t>& csr) {

@@ -33,7 +33,8 @@ namespace {
 
 struct options_t {
   std::string graph, dataset = "unknown", lb = "block", blossom = "mat", table = "compact";
-  size_t path_buffer_ratio = 1, odd_node_ratio = 30;
+  size_t path_buffer_ratio = 1;
+  double odd_node_ratio = 30; // blossom-list entries per node; may be fractional
   int warmup = 1, rounds = 10;
 };
 
@@ -47,7 +48,7 @@ options_t parse(int argc, char** argv) {
     else if (k == "-p") o.path_buffer_ratio = std::stoul(v);
     else if (k == "-M") o.blossom = v;
     else if (k == "-T") o.table = v;
-    else if (k == "-o") o.odd_node_ratio = std::stoul(v);
+    else if (k == "-o") o.odd_node_ratio = std::stod(v);
     else if (k == "-w") o.warmup = std::stoi(v);
     else if (k == "-r") o.rounds = std::stoi(v);
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
@@ -131,20 +132,37 @@ int main(int argc, char** argv) {
   using weight_t = float;
   using csr_t = format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(o.graph);
+  // The CSR is built on the host and only its offsets and column indices go to
+  // the device: X-Blossom never reads an edge weight, and the weights Gunrock's
+  // advances load per edge are aliased to the column indices (on Webbase, 1.7
+  // billion arcs, that is 6.8 GB of device memory the weights would take).
+  using host_csr_t = format::csr_t<memory_space_t::host, vertex_t, edge_t, weight_t>;
+  graph::graph_properties_t properties;
+  host_csr_t hcsr;
+  {
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(o.graph);
+    properties = props;
+    hcsr.from_coo(coo);
+  }  // the COO is freed here
   csr_t csr;
-  csr.from_coo(coo);
+  csr.number_of_rows = hcsr.number_of_rows;
+  csr.number_of_columns = hcsr.number_of_columns;
+  csr.number_of_nonzeros = hcsr.number_of_nonzeros;
+  csr.row_offsets = hcsr.row_offsets;
+  csr.column_indices = hcsr.column_indices;
   auto G = graph::build<memory_space_t::device>(properties, csr);
+  G.alias_values(reinterpret_cast<weight_t*>(thrust::raw_pointer_cast(csr.column_indices.data())));
+  static_assert(sizeof(weight_t) == sizeof(vertex_t), "the weights alias the column indices");
 
-  std::vector<int> row(csr.row_offsets.size()), col(csr.column_indices.size());
-  thrust::copy(csr.row_offsets.begin(), csr.row_offsets.end(), row.begin());
-  thrust::copy(csr.column_indices.begin(), csr.column_indices.end(), col.begin());
+  std::vector<int> row(hcsr.row_offsets.begin(), hcsr.row_offsets.end());
+  std::vector<int> col(hcsr.column_indices.begin(), hcsr.column_indices.end());
+  hcsr = host_csr_t();  // the host copies above are what the matching check reads
   long max_degree = 0;
   for (size_t v = 0; v + 1 < row.size(); v++) max_degree = std::max<long>(max_degree, row[v + 1] - row[v]);
 
   std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s path_table=%s dataset=%s nodes=%d edges=%ld "
-              "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu odd_node_ratio=%zu\n",
+              "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu odd_node_ratio=%g\n",
               o.lb.c_str(), o.blossom.c_str(), o.table.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
               static_cast<long>(G.get_number_of_edges()) / 2, max_degree, o.warmup, o.rounds,
               o.path_buffer_ratio, o.odd_node_ratio);
