@@ -1308,6 +1308,23 @@ namespace zblossom {
       // cycle:  reverse(chain s..u, u excluded) + o + chain(o..base),
       // read from the path table: the same nodes the blossom buffer's
       // ExpandNodesFromBlossomDirectional copies for the odd node on s's side.
+      // Table-agnostic entry points (shared with path_table_tuple.h): f(n) for
+      // every node of s's chain down to base that is not a segment's last node
+      // (the engine keeps the odd ones), and the odd-node transform that
+      // counts the chain itself
+      template<typename F>
+      DEV_INLINE void ForEachRecordedOddOnChain(index_t s, index_t base, F f) const {
+        index_t cur = s;
+        while (cur != base) {
+          const OffsetLength ol = LoadOL(cur);
+          if (ol.second == 0) return; // the root without meeting the base: cannot happen in a static forest
+          for (index_t i = 0; i + 1 < ol.second; i++) f(LoadPath(ol.first + i));
+          cur = LoadPath(ol.first + ol.second - 1);
+        }
+      }
+      DEV_INLINE void ExpandOddNodeAroundBlossom(index_t u, index_t s, index_t o, index_t base) {
+        ExpandOddNodeAroundBlossom(u, s, o, base, CountChainBefore(s, u));
+      }
       DEV_INLINE void ExpandOddNodeAroundBlossom(index_t u, index_t s, index_t o, index_t base, size_t count_s) {
         const size_t len_o = LoadRootDistance(o) - LoadRootDistance(base); // o's chain, o excluded, base included
         const size_t total = count_s + 1 + len_o;

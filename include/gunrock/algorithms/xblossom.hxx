@@ -41,6 +41,8 @@
 #include "utils/cuda_algo.h"
 #include "enode_queue/enode_queue.h"
 #include "path_table/path_table.h"
+#include "path_table/path_table_tuple.h"
+#include <type_traits>
 #include <algorithm>
 #include <chrono>
 
@@ -59,25 +61,21 @@ __device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, f
                                                      flags_t& atomic_locks_odd_nodes, list_t& task_node,
                                                      array_t& task_s, array_t& task_o, array_t& task_base,
                                                      index_t s, index_t o, index_t base) {
-  index_t cur = s;
-  while (cur != base) {
-    const zblossom::dev::OffsetLength ol = path_table.LoadOL(cur);
-    if (ol.second == 0) return;
-    for (index_t i = 0; i + 1 < ol.second; i++) {
-      const index_t n = path_table.LoadPath(ol.first + i);
-      if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
-        const offset_t t = task_node.Append(n);
-        task_s[t] = s;
-        task_o[t] = o;
-        task_base[t] = base;
-      }
+  path_table.ForEachRecordedOddOnChain(s, base, [&](index_t n) {
+    if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
+      const offset_t t = task_node.Append(n);
+      task_s[t] = s;
+      task_o[t] = o;
+      task_base[t] = base;
     }
-    cur = path_table.LoadPath(ol.first + ol.second - 1);
-  }
+  });
 }
 
-template <operators::load_balance_t LB, typename graph_t>
+// path_table_t: zblossom::dev::PathTable (the path table as is, mat or nomat)
+// or zblossom::dev::TuplePathTable (three vertex ids per node, nomat only).
+template <operators::load_balance_t LB, typename graph_t, typename path_table_t = zblossom::dev::PathTable>
 class engine_t {
+  static constexpr bool kTuple = std::is_same<path_table_t, zblossom::dev::TuplePathTable>::value;
   using vertex_t = typename graph_t::vertex_type;
   using edge_t = typename graph_t::edge_type;
   using weight_t = typename graph_t::weight_type;
@@ -148,6 +146,8 @@ class engine_t {
   size_t PeakTransformTasks() const { return peak_tasks_; }
   size_t PathsUsed() const { return path_table_.PathsUsed(); }
   size_t BufferCapacity() const { return path_table_.BufferCapacity(); }
+  size_t PathTableFixedBytes() const { return path_table_.FixedBytes(); }
+  int FlipStackPeak() const { return path_table_.FlipStackPeak(); }
   size_t BlossomListCapacity() const { return num_odd_nodes_in_blossom_list_.size(); }
 
   // Public: nvcc requires the enclosing function of an extended __device__
@@ -163,7 +163,7 @@ class engine_t {
 
   DArray<index_t> dev_matching_;
   DValue<DFlag> dev_found_;
-  zblossom::dev::PathTable path_table_;
+  path_table_t path_table_;
   DArray<DFlag> is_even_;
   DArray<index_t> tree_roots_;
   DArray<index_t> blossom_to_base_;
@@ -433,13 +433,14 @@ class engine_t {
         const index_t s = task_s[t];
         const index_t o = task_o[t];
         const index_t base = task_base[t];
-        path_table.ExpandOddNodeAroundBlossom(u, s, o, base, path_table.CountChainBefore(s, u));
+        path_table.ExpandOddNodeAroundBlossom(u, s, o, base);
         atomicExch(&is_even[u], 1);
         queue.AppendENode2(u);
       });
       return;
     }
 
+    if constexpr (!kTuple) {
     // mat (as is): find the blossoms closed by frontier edges, each materialised in the blossom buffer
     Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
       auto matching = matching_v;
@@ -517,6 +518,7 @@ class engine_t {
         queue.AppendENode2(odd_node);
       }
     });
+    }
   }
 };
 

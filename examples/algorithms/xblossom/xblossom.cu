@@ -1,7 +1,7 @@
 // X-Blossom++ maximum matching on Gunrock (include/gunrock/algorithms/xblossom.hxx).
 //
 //   xblossom -m <graph.mtx> [-d dataset] [-l block|thread] [-p path_buffer_ratio]
-//            [-M mat|nomat] [-o odd_node_ratio] [-w warmup] [-r rounds]
+//            [-M mat|nomat|tuple] [-o odd_node_ratio] [-w warmup] [-r rounds]
 //
 // Runs warm-up + timed rounds, each a full maximum matching from the empty
 // matching on a fresh engine (only FindMaximumMatch is timed, as XB++), checks
@@ -10,6 +10,7 @@
 //   XBRound: index runtime_s matching_size valid        per timed round
 //   XBPhases: index aug_path_s expand_s blossom_s steps   per timed round
 //   XBMemory: index paths_used blossom_buffer_peak blossom_list_peak buffer_capacity list_capacity
+//             transform_tasks_peak table_bytes flip_stack_peak
 //   XBResult: status matching_size valid rounds mean_runtime_s
 #include <gunrock/algorithms/xblossom.hxx>
 
@@ -46,7 +47,10 @@ options_t parse(int argc, char** argv) {
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
   }
   if (o.graph.empty()) { std::fprintf(stderr, "usage: xblossom -m <graph.mtx> ...\n"); std::exit(2); }
-  if (o.blossom != "mat" && o.blossom != "nomat") { std::fprintf(stderr, "-M must be mat or nomat\n"); std::exit(2); }
+  if (o.blossom != "mat" && o.blossom != "nomat" && o.blossom != "tuple") {
+    std::fprintf(stderr, "-M must be mat, nomat or tuple\n");
+    std::exit(2);
+  }
   return o;
 }
 
@@ -67,14 +71,16 @@ long check_matching(const std::vector<int>& row, const std::vector<int>& col, co
   return matched / 2;
 }
 
-template <operators::load_balance_t LB, typename graph_t>
+// path_table_t: the path table as is (-M mat|nomat) or the tuple path table (-M tuple, nomat)
+template <operators::load_balance_t LB, typename path_table_t, typename graph_t>
 int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::vector<int>& col) {
   auto context = std::make_shared<gcuda::multi_context_t>(0);
   double total = 0;
   long first = -2;
   bool all_valid = true, all_same = true;
   for (int i = 0; i < o.warmup + o.rounds; i++) {
-    xblossom::engine_t<LB, graph_t> engine(G, o.path_buffer_ratio, o.odd_node_ratio, o.blossom == "nomat", context);
+    xblossom::engine_t<LB, graph_t, path_table_t> engine(G, o.path_buffer_ratio, o.odd_node_ratio,
+                                                         o.blossom != "mat", context);
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<index_t> mate = engine.FindMaximumMatch();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -92,9 +98,10 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
     std::printf("XBPhases: index=%d aug_path_s=%.9f expand_s=%.9f blossom_s=%.9f steps=%zu\n", i - o.warmup, aug_s,
                 expand_s, blossom_s, engine.Steps());
     std::printf("XBMemory: index=%d paths_used=%zu blossom_buffer_peak=%zu blossom_list_peak=%zu "
-                "buffer_capacity=%zu list_capacity=%zu transform_tasks_peak=%zu\n", i - o.warmup, engine.PathsUsed(),
-                engine.PeakBlossomBufferNodes(), engine.PeakBlossomListEntries(), engine.BufferCapacity(),
-                engine.BlossomListCapacity(), engine.PeakTransformTasks());
+                "buffer_capacity=%zu list_capacity=%zu transform_tasks_peak=%zu table_bytes=%zu flip_stack_peak=%d\n",
+                i - o.warmup, engine.PathsUsed(), engine.PeakBlossomBufferNodes(), engine.PeakBlossomListEntries(),
+                engine.BufferCapacity(), engine.BlossomListCapacity(), engine.PeakTransformTasks(),
+                engine.PathTableFixedBytes(), engine.FlipStackPeak());
     std::fflush(stdout);
   }
   const char* status = !all_valid ? "invalid_matching" : (!all_same ? "matching_size_varies" : "ok");
@@ -127,13 +134,20 @@ int main(int argc, char** argv) {
 
   std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s dataset=%s nodes=%d edges=%ld "
               "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu odd_node_ratio=%zu\n",
-              o.lb.c_str(), o.blossom.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
+              o.lb.c_str(), o.blossom == "tuple" ? "nomat-tuple" : o.blossom.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
               static_cast<long>(G.get_number_of_edges()) / 2, max_degree, o.warmup, o.rounds,
               o.path_buffer_ratio, o.odd_node_ratio);
   std::fflush(stdout);
 
-  if (o.lb == "block") return run<operators::load_balance_t::block_mapped>(G, o, row, col);
-  if (o.lb == "thread") return run<operators::load_balance_t::thread_mapped>(G, o, row, col);
+  using table_t = zblossom::dev::PathTable;
+  using tuple_t = zblossom::dev::TuplePathTable;
+  const bool tuple = o.blossom == "tuple";
+  if (o.lb == "block")
+    return tuple ? run<operators::load_balance_t::block_mapped, tuple_t>(G, o, row, col)
+                 : run<operators::load_balance_t::block_mapped, table_t>(G, o, row, col);
+  if (o.lb == "thread")
+    return tuple ? run<operators::load_balance_t::thread_mapped, tuple_t>(G, o, row, col)
+                 : run<operators::load_balance_t::thread_mapped, table_t>(G, o, row, col);
   // merge_path is left out: on this Gunrock build it issues no work for these
   // advances (no error, the operator is never called), and none of Gunrock's
   // own algorithms here use it.
