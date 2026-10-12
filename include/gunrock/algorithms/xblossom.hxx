@@ -479,6 +479,7 @@ class engine_t {
       auto nodes_in_blossom = nodes_in_blossom_v;
       auto odd_in_blossom = odd_in_blossom_v;
       auto odd_vside_in_blossom = odd_vside_in_blossom_v;
+      const bool rootpath = base_rootpath; // captured here: nvcc rejects a first capture inside if constexpr
       index_t root_v = tree_roots[v];
       index_t root_w = tree_roots[w];
       if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
@@ -488,7 +489,7 @@ class engine_t {
         if constexpr (kTuple) {
           if (!path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom))
             return false; // the cycle buffer is full; the host aborts the run after this kernel
-        } else if (base_rootpath) {
+        } else if (rootpath) {
           index_t w_idx_in_blossom;
           if (!path_table.FindBlossomInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom, v_idx_in_blossom,
                                                      w_idx_in_blossom))
