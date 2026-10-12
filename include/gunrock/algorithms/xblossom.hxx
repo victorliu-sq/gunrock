@@ -145,6 +145,7 @@ class engine_t {
   // path segments written, and the capacities
   size_t PeakBlossomBufferNodes() const { return peak_buffer_; }
   size_t PeakBlossomListEntries() const { return peak_list_; }
+  size_t PeakTransformTasks() const { return peak_tasks_; }
   size_t PathsUsed() const { return path_table_.PathsUsed(); }
   size_t BufferCapacity() const { return path_table_.BufferCapacity(); }
   size_t BlossomListCapacity() const { return num_odd_nodes_in_blossom_list_.size(); }
@@ -156,7 +157,7 @@ class engine_t {
   bool nomat_;
   size_t nnodes_;
   double t_aug_{0}, t_expand_{0}, t_blossom_{0};
-  size_t steps_{0}, peak_buffer_{0}, peak_list_{0};
+  size_t steps_{0}, peak_buffer_{0}, peak_list_{0}, peak_tasks_{0};
   int found_{DFLAG_FALSE};
   int exhausted_{DFLAG_FALSE};
 
@@ -175,7 +176,7 @@ class engine_t {
   DArray<index_t> num_nodes_in_blossom_list_;
   DArray<index_t> num_odd_nodes_vside_in_blossom_list_;
   DArray<index_t> num_odd_nodes_in_blossom_list_;
-  DArray<index_t> num_odd_nodes_in_blossom_psum_;
+  DArray<offset_t> num_odd_nodes_in_blossom_psum_; // 64-bit: a step's odd-node tasks can exceed 2^31
 
   CudaStream cuda_stream_;
   DVector<char> scan_temp_;
@@ -480,9 +481,10 @@ class engine_t {
                                              static_cast<int>(num_blossom + 1), cuda_stream_.cuda_stream()));
     cuda_stream_.Sync();
     const size_t total_transforms = num_odd_nodes_in_blossom_psum_[num_blossom];
+    peak_tasks_ = std::max(peak_tasks_, total_transforms);
     if (total_transforms == 0) return;
     auto psum_v = num_odd_nodes_in_blossom_psum_.DeviceView();
-    LaunchKernelForEachMax(cuda_stream_, total_transforms, [=] __device__(index_t tid) {
+    LaunchKernelForEachMax(cuda_stream_, total_transforms, [=] __device__(size_t tid) {
       auto matching = matching_v;
       auto path_table = path_table_v;
       auto is_even = is_even_v;
@@ -494,11 +496,11 @@ class engine_t {
       auto odd_in_blossom = odd_in_blossom_v;
       auto odd_vside_in_blossom = odd_vside_in_blossom_v;
       auto psum = psum_v;
-      index_t b = FindRightmostLTEQ(psum, num_blossom + 1, tid);
+      index_t b = FindRightmostLTEQ64(psum, num_blossom + 1, static_cast<offset_t>(tid));
       offset_t blossom_offset = blossom_offsets[b];
       index_t nnodes_in_blossom = nodes_in_blossom[b];
       index_t num_odd_vside = odd_vside_in_blossom[b];
-      index_t delta = tid - psum[b];
+      index_t delta = static_cast<index_t>(static_cast<offset_t>(tid) - psum[b]);
       int is_vside = delta <= (num_odd_vside - 1);
       index_t odd_idx = 1 + 2 * delta + (1 - is_vside);
       index_t odd_node = path_table.GetNodeFromBlossomInBlossomBuffer(blossom_offset, odd_idx);

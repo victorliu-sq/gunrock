@@ -5,6 +5,16 @@
 #include "dev_array.h"
 #include "utils_gpu.h"
 
+// 64-bit prefix sums (a step's odd-node tasks can exceed 2^31 on Orkut)
+DEV_INLINE offset_t FindRightmostLTEQ64(const DArrayView<offset_t>& array_dview, size_t n, offset_t target) {
+  offset_t left = 0, right = static_cast<offset_t>(n) - 1;
+  while (left < right) {
+    offset_t mid = left + (right - left) / 2;
+    if (array_dview[mid + 1] <= target) left = mid + 1; else right = mid;
+  }
+  return left;
+}
+
 DEV_INLINE index_t FindRightmostLTEQ(const DArrayView<int>& array_dview, size_t n, int target) {
   int left = 0, right = n - 1;
   while (left < right) {
