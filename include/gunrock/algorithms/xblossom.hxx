@@ -44,6 +44,8 @@
 #include "path_table/path_table_tuple.h"
 #include <type_traits>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <chrono>
 
 namespace gunrock {
@@ -461,7 +463,8 @@ class engine_t {
         size_t nnodes_in_blossom;
         index_t v_idx_in_blossom;
         if constexpr (kTuple) {
-          path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom);
+          if (!path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom))
+            return false; // the cycle buffer is full; the host aborts the run after this kernel
         } else {
           path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
                                                                          v_idx_in_blossom);
@@ -478,6 +481,10 @@ class engine_t {
     });
 
     // Make their odd nodes even (one tasklet per odd node).
+    if (path_table_.CycleOverflow()) {
+      std::fprintf(stderr, "XBError: cycle buffer full (%zu nodes); raise -p\n", path_table_.BufferCapacity());
+      std::exit(4);
+    }
     const size_t num_blossom = blossom_offset_list_.size();
     peak_list_ = std::max(peak_list_, num_blossom);
     peak_buffer_ = std::max(peak_buffer_, path_table_.BlossomBufferUsed());

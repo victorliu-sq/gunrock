@@ -245,6 +245,7 @@ namespace zblossom {
       size_t BufferCapacity() const { return path_buffer_size_; }
       size_t FixedBytes() const { return nnnodes_ * (sizeof(OffsetLength) + sizeof(index_t)); }
       int FlipStackPeak() const { return 0; }
+      bool CycleOverflow() const { return false; } // the segment table asserts in DList::Reserve instead
 
       // defined after the PathTable class
       PathTableView DeviceView();

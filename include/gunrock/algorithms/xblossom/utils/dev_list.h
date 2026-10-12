@@ -115,6 +115,8 @@ public:
   //   // return *counter_;
   // }
 
+  DEV_INLINE size_t capacity() const { return array_.size(); }
+
 private:
   DArrayView<T> array_;
   DValueView<offset_t> counter_;

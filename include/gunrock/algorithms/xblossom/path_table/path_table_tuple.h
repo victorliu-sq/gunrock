@@ -57,8 +57,9 @@ namespace zblossom {
       // keeps the records alone
       explicit TuplePathTable(size_t nnnodes, size_t buffer_ratio, bool mat = false)
         : nnnodes_(nnnodes), mat_(mat), rec_(3 * nnnodes), rd_(mat ? nnnodes : 1),
-          cycles_(mat ? buffer_ratio * nnnodes : 1), flip_stack_peak_() {
+          cycles_(mat ? buffer_ratio * nnnodes : 1), flip_stack_peak_(), cycle_overflow_() {
         flip_stack_peak_.SetH2D(0);
+        cycle_overflow_.SetH2D(0);
       }
 
       void ResetPathTable() { rec_.Fill(static_cast<index_t>(nnnodes_)); }
@@ -73,6 +74,8 @@ namespace zblossom {
       // the records, plus the root distances under mat
       size_t FixedBytes() const { return (mat_ ? 4 : 3) * nnnodes_ * sizeof(index_t); }
       int FlipStackPeak() const { return flip_stack_peak_.GetD2H(); }
+      // mat: a closing edge's cycle did not fit the cycle buffer (the run is then invalid)
+      bool CycleOverflow() const { return mat_ && cycle_overflow_.GetD2H() != 0; }
 
       TuplePathTableView DeviceView();
 
@@ -83,15 +86,16 @@ namespace zblossom {
       DArray<index_t> rd_;  // mat: nodes on the route after each node
       DList<index_t> cycles_; // mat: the materialised cycles of one step
       DValue<int> flip_stack_peak_;
+      DValue<int> cycle_overflow_;
     };
 
     class TuplePathTableView {
     public:
       DEV_HOST_INLINE
       TuplePathTableView(size_t nnnodes, bool mat, DArrayView<index_t> rec, DArrayView<index_t> rd,
-                         DListView<index_t> cycles, DValueView<int> flip_stack_peak)
+                         DListView<index_t> cycles, DValueView<int> flip_stack_peak, DValueView<int> cycle_overflow)
         : nnnodes_(nnnodes), none_(static_cast<index_t>(nnnodes)), mat_(mat), rec_(rec), rd_(rd),
-          cycles_(cycles), flip_stack_peak_(flip_stack_peak) {
+          cycles_(cycles), flip_stack_peak_(flip_stack_peak), cycle_overflow_(cycle_overflow) {
       }
 
       struct Rec {
@@ -135,17 +139,25 @@ namespace zblossom {
       // materialising table lays it out: base ... v | w ... base (v at v_idx,
       // w at v_idx + 1, base first and last). Each side is the route of its
       // endpoint down to the base, expanded from the records.
-      DEV_INLINE void MaterializeCycle(index_t v, index_t w, const DArrayView<index_t> &matching,
+      // Returns false, and flags the table, when the cycle does not fit the buffer
+      // (the release build has no bounds check, and a cycle written past the end
+      // corrupts what the walks read)
+      DEV_INLINE bool MaterializeCycle(index_t v, index_t w, const DArrayView<index_t> &matching,
                                        offset_t &offset, size_t &len, index_t &v_idx) {
         index_t base;
         FindBlossomBaseByAnchorNode(v, w, base);
         const size_t nv = static_cast<size_t>(rd_[v] - rd_[base]) + 1;
         const size_t nw = static_cast<size_t>(rd_[w] - rd_[base]) + 1;
         offset = cycles_.Reserve(nv + nw);
+        if (static_cast<size_t>(offset) + nv + nw > cycles_.capacity()) {
+          atomicExch(&cycle_overflow_, 1);
+          return false;
+        }
         WriteRoute(v, base, offset + static_cast<offset_t>(nv) - 1, -1, matching);
         WriteRoute(w, base, offset + static_cast<offset_t>(nv), +1, matching);
         len = nv + nw;
         v_idx = static_cast<index_t>(nv - 1);
+        return true;
       }
       DEV_INLINE index_t CycleNode(offset_t offset, index_t idx) const { return cycles_[offset + idx]; }
       // a repeated node on the span of the cycle a conversion would use (as mat checks)
@@ -310,11 +322,12 @@ namespace zblossom {
       DArrayView<index_t> rd_;
       DListView<index_t> cycles_;
       DValueView<int> flip_stack_peak_;
+      DValueView<int> cycle_overflow_;
     };
 
     inline TuplePathTableView TuplePathTable::DeviceView() {
       return TuplePathTableView(nnnodes_, mat_, rec_.DeviceView(), rd_.DeviceView(), cycles_.DeviceView(),
-                                flip_stack_peak_.DeviceView());
+                                flip_stack_peak_.DeviceView(), cycle_overflow_.DeviceView());
     }
   }
 }
