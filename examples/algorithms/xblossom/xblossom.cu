@@ -1,8 +1,12 @@
 // X-Blossom++ maximum matching on Gunrock (include/gunrock/algorithms/xblossom.hxx).
 //
 //   xblossom -m <graph.mtx> [-d dataset] [-l block|thread] [-p path_buffer_ratio]
-//            [-M mat|nomat] [-T compact|segment] [-q segment_buffer_ratio] [-o odd_node_ratio]
-//            [-w warmup] [-r rounds]
+//            [-M mat|nomat] [-T compact|segment] [-B onthefly|rootpath] [-q segment_buffer_ratio]
+//            [-o odd_node_ratio] [-w warmup] [-r rounds]
+//
+// -B (segment table, mat only) picks the blossom-base identification: onthefly
+// (default; the two walks of Sec. 4.B.1) or rootpath (the original X-Blossom's:
+// both endpoint-to-root paths materialised and scanned from the root).
 //
 // -T selects the path table: compact (default; three vertex ids per node) or
 // segment (the explicit segments of the original X-Blossom++). -p sizes the
@@ -33,7 +37,7 @@ using namespace memory;
 namespace {
 
 struct options_t {
-  std::string graph, dataset = "unknown", lb = "block", blossom = "mat", table = "compact";
+  std::string graph, dataset = "unknown", lb = "block", blossom = "mat", table = "compact", base = "onthefly";
   size_t path_buffer_ratio = 1, segment_buffer_ratio = 0; // 0: as -p
   double odd_node_ratio = 30; // blossom-list entries per node; may be fractional
   int warmup = 1, rounds = 10;
@@ -49,6 +53,7 @@ options_t parse(int argc, char** argv) {
     else if (k == "-p") o.path_buffer_ratio = std::stoul(v);
     else if (k == "-M") o.blossom = v;
     else if (k == "-T") o.table = v;
+    else if (k == "-B") o.base = v;
     else if (k == "-q") o.segment_buffer_ratio = std::stoul(v);
     else if (k == "-o") o.odd_node_ratio = std::stod(v);
     else if (k == "-w") o.warmup = std::stoi(v);
@@ -63,6 +68,14 @@ options_t parse(int argc, char** argv) {
   }
   if (o.table != "compact" && o.table != "segment") {
     std::fprintf(stderr, "-T must be compact or segment\n");
+    std::exit(2);
+  }
+  if (o.base != "onthefly" && o.base != "rootpath") {
+    std::fprintf(stderr, "-B must be onthefly or rootpath\n");
+    std::exit(2);
+  }
+  if (o.base == "rootpath" && (o.table != "segment" || o.blossom != "mat")) {
+    std::fprintf(stderr, "-B rootpath needs -T segment -M mat\n");
     std::exit(2);
   }
   return o;
@@ -96,7 +109,7 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
     xblossom::engine_t<LB, graph_t, path_table_t> engine(G, o.path_buffer_ratio,
                                                          o.segment_buffer_ratio ? o.segment_buffer_ratio : o.path_buffer_ratio,
                                                          o.odd_node_ratio,
-                                                         o.blossom != "mat", context);
+                                                         o.blossom != "mat", context, o.base == "rootpath");
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<index_t> mate = engine.FindMaximumMatch();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -165,9 +178,9 @@ int main(int argc, char** argv) {
   long max_degree = 0;
   for (size_t v = 0; v + 1 < row.size(); v++) max_degree = std::max<long>(max_degree, row[v + 1] - row[v]);
 
-  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s path_table=%s dataset=%s nodes=%d edges=%ld "
+  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s path_table=%s base=%s dataset=%s nodes=%d edges=%ld "
               "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu segment_buffer_ratio=%zu odd_node_ratio=%g\n",
-              o.lb.c_str(), o.blossom.c_str(), o.table.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
+              o.lb.c_str(), o.blossom.c_str(), o.table.c_str(), o.base.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
               static_cast<long>(G.get_number_of_edges()) / 2, max_degree, o.warmup, o.rounds,
               o.path_buffer_ratio, o.segment_buffer_ratio ? o.segment_buffer_ratio : o.path_buffer_ratio, o.odd_node_ratio);
   std::fflush(stdout);

@@ -94,11 +94,15 @@ class engine_t {
   // in entries per node; it may be fractional (nomat needs well under one per node).
   // path_table_buffer_ratio sizes the cycle buffer (mat), segment_buffer_ratio
   // the segment table's buffer (-T segment); both x n nodes.
+  // base_rootpath (segment table, mat only): find each blossom's base as the
+  // original X-Blossom does, by materialising both endpoint-to-root paths and
+  // scanning them from the root; otherwise on the fly, by the two anchor walks.
   engine_t(graph_t& G, size_t path_table_buffer_ratio, size_t segment_buffer_ratio, double odd_node_ratio, bool nomat,
-           std::shared_ptr<gcuda::multi_context_t> context)
+           std::shared_ptr<gcuda::multi_context_t> context, bool base_rootpath = false)
       : G_(G),
         context_(context),
         nomat_(nomat),
+        base_rootpath_(base_rootpath),
         nnodes_(G.get_number_of_vertices()),
         dev_matching_(nnodes_, nnodes_),
         path_table_(nnodes_, path_table_buffer_ratio, segment_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
@@ -166,6 +170,7 @@ class engine_t {
   graph_t& G_;
   std::shared_ptr<gcuda::multi_context_t> context_;
   bool nomat_;
+  bool base_rootpath_;
   size_t nnodes_;
   double t_aug_{0}, t_expand_{0}, t_blossom_{0};
   size_t steps_{0}, peak_buffer_{0}, peak_list_{0}, peak_tasks_{0};
@@ -462,6 +467,7 @@ class engine_t {
     }
 
     // mat (as is): find the blossoms closed by frontier edges, each materialised in the blossom buffer
+    const bool base_rootpath = base_rootpath_;
     Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
       auto matching = matching_v;
       auto path_table = path_table_v;
@@ -482,9 +488,15 @@ class engine_t {
         if constexpr (kTuple) {
           if (!path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom))
             return false; // the cycle buffer is full; the host aborts the run after this kernel
+        } else if (base_rootpath) {
+          index_t w_idx_in_blossom;
+          if (!path_table.FindBlossomInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom, v_idx_in_blossom,
+                                                     w_idx_in_blossom))
+            return false; // the buffer is full (flagged) or the forest changed under the worker
         } else {
-          path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
-                                                                         v_idx_in_blossom);
+          if (!path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
+                                                                              v_idx_in_blossom))
+            return false;
         }
         size_t num_odd_vside = v_idx_in_blossom >> 1;
         size_t num_odd = (nnodes_in_blossom - 2) >> 1;

@@ -174,6 +174,7 @@ namespace zblossom {
           offset_length_(nnnodes),
           root_distance_(nnnodes),
           blossom_buffer_(path_buffer_size_) {
+        cycle_overflow_.SetH2D(0);
         try {
           // offset_length_.resize(nnnodes);
           // root_distance_.resize(nnnodes);
@@ -201,7 +202,7 @@ namespace zblossom {
           paths_(path_buffer_size_),
           offset_length_(nnnodes),
           root_distance_(nnnodes),
-          blossom_buffer_(cycle_ratio * nnnodes) {}
+          blossom_buffer_(cycle_ratio * nnnodes) { cycle_overflow_.SetH2D(0); }
 
       explicit PathTable(size_t nnnodes, size_t buffer_ratio)
         : nnnodes_(nnnodes),
@@ -210,6 +211,7 @@ namespace zblossom {
           offset_length_(nnnodes),
           root_distance_(nnnodes),
           blossom_buffer_(buffer_ratio * nnnodes) {
+        cycle_overflow_.SetH2D(0);
         try {
           // offset_length_.resize(nnnodes);
           // root_distance_.resize(nnnodes);
@@ -256,7 +258,9 @@ namespace zblossom {
       size_t BufferCapacity() const { return path_buffer_size_; }
       size_t FixedBytes() const { return nnnodes_ * (sizeof(OffsetLength) + sizeof(index_t)); }
       int FlipStackPeak() const { return 0; }
-      bool CycleOverflow() const { return false; } // the segment table asserts in DList::Reserve instead
+      // a closing edge's cycle (or, under the original base identification, its
+      // two root paths) did not fit the blossom buffer: the run is then invalid
+      bool CycleOverflow() const { return cycle_overflow_.GetD2H() != 0; }
 
       // defined after the PathTable class
       PathTableView DeviceView();
@@ -272,6 +276,7 @@ namespace zblossom {
 
       DList<index_t> paths_;
       DList<index_t> blossom_buffer_;
+      DValue<int> cycle_overflow_;
     };
 
     class PathTableView {
@@ -282,7 +287,8 @@ namespace zblossom {
                              DArrayView<OffsetLength > paths_offset_length,
                              DArrayView<index_t> paths_root_distance,
                              DListView<index_t> paths,
-                             DListView<index_t> path_buffer
+                             DListView<index_t> path_buffer,
+                             DValueView<int> cycle_overflow
                              // DArrayView<index_t> paths,
                              // DArrayView<index_t> path_buffer,
                              // DValueView<index_t> paths_offsets,
@@ -293,7 +299,19 @@ namespace zblossom {
           offset_length_(paths_offset_length),
           root_distance_(paths_root_distance),
           paths_(paths),
-          blossom_buffer_(path_buffer) {
+          blossom_buffer_(path_buffer),
+          cycle_overflow_(cycle_overflow) {
+      }
+
+      // the blossom buffer has no bounds check in a release build: a reservation
+      // past its end is flagged and the caller gives the edge up
+      DEV_INLINE bool ReserveOrFlag(size_t n, offset_t &offset) {
+        offset = blossom_buffer_.Reserve(n);
+        if (static_cast<size_t>(offset) + n > blossom_buffer_.capacity()) {
+          atomicExch(&cycle_overflow_, 1);
+          return false;
+        }
+        return true;
       }
 
       // Reads of segments and depths. In the nested blossom phase
@@ -536,7 +554,8 @@ namespace zblossom {
 
         // 1-2 Resevere space for both path v and path w
         // offset_t path_v_offset = atomicAdd(blossom_buffer_offset_.Addr(), path_v_len + path_w_len);
-        offset_t path_v_offset = blossom_buffer_.Reserve(nnnodes_v_root + nnode_w_root);
+        offset_t path_v_offset;
+        if (!ReserveOrFlag(nnnodes_v_root + nnode_w_root, path_v_offset)) return false;
         offset_t path_w_offset = path_v_offset + nnnodes_v_root;
 
         // 1-3 Traverse path v to root and store it in paths_buffer
@@ -927,7 +946,7 @@ namespace zblossom {
         size_t nnodes_w_to_base = len_w_to_base + 1;
 
         // reserve blossom offset
-        blossom_offset = blossom_buffer_.Reserve(nnodes_v_to_base + nnodes_w_to_base);
+        if (!ReserveOrFlag(nnodes_v_to_base + nnodes_w_to_base, blossom_offset)) return false;
         num_nodes_in_blossom = nnodes_v_to_base + nnodes_w_to_base;
 
         // read v to base in reverse order
@@ -1463,6 +1482,7 @@ namespace zblossom {
       DListView<index_t> paths_;
 
       DListView<index_t> blossom_buffer_;
+      DValueView<int> cycle_overflow_;
     };
 
     inline PathTableView PathTable::DeviceView() {
@@ -1471,7 +1491,8 @@ namespace zblossom {
                            this->offset_length_.DeviceView(),
                            this->root_distance_.DeviceView(),
                            this->paths_.DeviceView(),
-                           this->blossom_buffer_.DeviceView()
+                           this->blossom_buffer_.DeviceView(),
+                           this->cycle_overflow_.DeviceView()
       );
     }
   }
