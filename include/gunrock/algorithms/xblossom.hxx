@@ -29,6 +29,11 @@
 #include <gunrock/algorithms/algorithms.hxx>
 
 #include <cub/cub.cuh>
+#include <thrust/transform_reduce.h>
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 // X-Blossom's device structures (vendored; the example adds
 // include/gunrock/algorithms/xblossom to the include path).
@@ -133,12 +138,33 @@ class engine_t {
 
   // Maximum matching from the empty matching; mate[v] == nnodes for exposed v.
   std::vector<index_t> FindMaximumMatch() {
+    // GACGE traversal statistics (measure/traversal-char), off unless
+    // GACGE_TRAVERSAL_STATS is set: one XBTraversal line per matching, and one
+    // XBStep line per advance for the matching numbered GACGE_TRAVERSAL_TRACE
+    // (0-based, default 1: the first after one warm-up).
+    static int run_index = -1;
+    ++run_index;
+    ts_on_ = std::getenv("GACGE_TRAVERSAL_STATS") != nullptr;
+    const char* trace_env = std::getenv("GACGE_TRAVERSAL_TRACE");
+    ts_trace_ = ts_on_ && run_index == (trace_env ? std::atoi(trace_env) : 1);
+    ts_run_ = run_index;
     dev_matching_.Fill(static_cast<index_t>(nnodes_));
     found_ = DFLAG_FALSE;
+    size_t searches = 1;
     FindAndFlipAugmentingPath();
     while (found_ == DFLAG_TRUE) {
       found_ = DFLAG_FALSE;
       FindAndFlipAugmentingPath();
+      searches++;
+    }
+    if (ts_on_) {
+      size_t steps = 0, fv = 0, fe = 0;
+      for (int k = 0; k < 3; k++) { steps += ts_steps_[k]; fv += ts_v_[k]; fe += ts_e_[k]; }
+      std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
+                  "nodes=%zu edges=%zu searches=%zu aug_steps=%zu aug_e=%zu expand_steps=%zu expand_e=%zu "
+                  "blossom_steps=%zu blossom_e=%zu\n",
+                  ts_run_, steps, fv, fe, ts_max_e_, ts_small_, nnodes_, (size_t)G_.get_number_of_edges(), searches,
+                  ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1], ts_steps_[2], ts_e_[2]);
     }
     std::vector<index_t> mate(nnodes_);
     thrust::copy(dev_matching_.begin(), dev_matching_.end(), mate.begin());
@@ -246,9 +272,40 @@ class engine_t {
     return size;
   }
 
+  // GACGE traversal statistics: per phase (0 AugPath, 1 Expand, 2 Blossom)
+  bool ts_on_{false}, ts_trace_{false};
+  int ts_run_{0}, ts_phase_{0};
+  size_t ts_steps_[3]{0, 0, 0}, ts_v_[3]{0, 0, 0}, ts_e_[3]{0, 0, 0}, ts_max_e_{0}, ts_small_{0};
+
+  // The loaded frontier's vertices and the edges the advance will examine (their degrees)
+  void TraversalStep() {
+    const size_t n = input_frontier_.get_number_of_elements();
+    size_t fe = 0;
+    if (n > 0) {
+      auto g = G_;
+      auto first = input_frontier_.begin();
+      fe = thrust::transform_reduce(
+          thrust::device, first, first + n,
+          [g] __device__(vertex_t const& v) -> size_t { return (size_t)g.get_number_of_neighbors(v); }, size_t(0),
+          thrust::plus<size_t>());
+    }
+    const int k = ts_phase_;
+    ts_steps_[k]++;
+    ts_v_[k] += n;
+    ts_e_[k] += fe;
+    ts_max_e_ = fe > ts_max_e_ ? fe : ts_max_e_;
+    ts_small_ += fe < 65536;
+    if (ts_trace_) {
+      static const char* names[3] = {"augpath", "expand", "blossom"};
+      std::printf("XBStep: run=%d step=%zu phase=%s frontier_v=%zu frontier_e=%zu\n", ts_run_,
+                  ts_steps_[0] + ts_steps_[1] + ts_steps_[2] - 1, names[k], n, fe);
+    }
+  }
+
   // One advance over the loaded frontier with LB; op returns false (no output).
   template <typename op_t>
   void Advance(op_t op) {
+    if (ts_on_) TraversalStep();
     operators::advance::execute<LB, operators::advance_direction_t::forward,
                                 operators::advance_io_type_t::vertices, operators::advance_io_type_t::none>(
         G_, op, &input_frontier_, &output_frontier_, segments_, *context_);
@@ -321,6 +378,7 @@ class engine_t {
   }
 
   bool FindAndFlipAugmentingPathInAlternatingForest() {
+    ts_phase_ = 0;
     if (LoadFrontier() == 0) return false;
     const index_t nnodes = nnodes_;
     auto matching_v = dev_matching_.DeviceView();
@@ -357,6 +415,7 @@ class engine_t {
   }
 
   void ExpandAlternatingForest() {
+    ts_phase_ = 1;
     if (enode_queue_.Size() == 0) return;
     LoadFrontier();
     const index_t nnodes = nnodes_;
@@ -407,6 +466,7 @@ class engine_t {
   }
 
   void TransformOddNodesInBlossom() {
+    ts_phase_ = 2;
     if (enode_queue_.Size() == 0) return;
     LoadFrontier();
     const index_t nnodes = nnodes_;

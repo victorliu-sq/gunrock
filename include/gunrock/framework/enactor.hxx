@@ -9,6 +9,12 @@
  */
 
 #include <vector>
+#include <cstdio>
+#include <cstdlib>
+
+#include <thrust/count.h>
+#include <thrust/execution_policy.h>
+#include <thrust/transform_reduce.h>
 
 #include <gunrock/cuda/cuda.hxx>
 
@@ -223,6 +229,28 @@ struct enactor_t {
   enactor_t* get_enactor() { return this; }
 
   /**
+   * @brief The active frontier's valid vertices and the edges they will
+   * examine (the sum of their degrees), for GACGE_TRAVERSAL_STATS.
+   */
+  void traversal_frontier_work(std::size_t& fv, std::size_t& fe) {
+    auto f = get_input_frontier();
+    auto n = f->get_number_of_elements();
+    fv = fe = 0;
+    if (n == 0)
+      return;
+    auto g = problem->get_graph();
+    auto first = f->begin();
+    fe = thrust::transform_reduce(
+        thrust::device, first, first + n,
+        [g] __device__(vertex_t const& v) -> std::size_t {
+          return gunrock::util::limits::is_valid(v) ? (std::size_t)g.get_number_of_neighbors(v) : 0;
+        },
+        std::size_t(0), thrust::plus<std::size_t>());
+    fv = thrust::count_if(thrust::device, first, first + n,
+                          [] __device__(vertex_t const& v) { return gunrock::util::limits::is_valid(v); });
+  }
+
+  /**
    * @brief Swap the inactive and active frontier buffers such that the inactive
    * buffer becomes the input buffer to the next operator and vice-versa.
    */
@@ -243,14 +271,40 @@ struct enactor_t {
   float enact() {
     auto single_context = context->get_context(0);
     prepare_frontier(get_input_frontier(), *context);
+    // GACGE traversal statistics (measure/traversal-char), off unless
+    // GACGE_TRAVERSAL_STATS is set: one XBTraversal line per enact(), and one
+    // XBStep line per iteration for the enact() numbered GACGE_TRAVERSAL_TRACE
+    // (0-based, default 1: the first after one warm-up). The counting adds work
+    // between iterations, so runtimes from such runs are not used.
+    static int enact_index = -1;
+    ++enact_index;
+    const bool stats = std::getenv("GACGE_TRAVERSAL_STATS") != nullptr;
+    const char* trace_env = std::getenv("GACGE_TRAVERSAL_TRACE");
+    const bool trace = stats && enact_index == (trace_env ? std::atoi(trace_env) : 1);
+    std::size_t t_steps = 0, t_v = 0, t_e = 0, t_max_e = 0, t_small = 0;
     auto timer = single_context->timer();
     timer.begin();
     while (!is_converged(*context)) {
+      if (stats) {
+        std::size_t fv = 0, fe = 0;
+        traversal_frontier_work(fv, fe);
+        t_steps++; t_v += fv; t_e += fe;
+        t_max_e = fe > t_max_e ? fe : t_max_e;
+        t_small += fe < 65536;
+        if (trace)
+          std::printf("XBStep: run=%d step=%zu phase=advance frontier_v=%zu frontier_e=%zu\n", enact_index,
+                      t_steps - 1, fv, fe);
+      }
       loop(*context);
       ++iteration;
     }
     finalize(*context);
     auto runtime = timer.end();
+    if (stats)
+      std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
+                  "nodes=%zu edges=%zu\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,
+                  (std::size_t)problem->get_graph().get_number_of_vertices(),
+                  (std::size_t)problem->get_graph().get_number_of_edges());
 #if (ESSENTIALS_COLLECT_METRICS)
     benchmark::____.search_depth = iteration;
     benchmark::____.total_runtime = runtime;
