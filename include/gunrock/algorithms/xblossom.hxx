@@ -514,7 +514,10 @@ class engine_t {
     // Make their odd nodes even (one tasklet per odd node).
     CheckListFits(blossom_offset_list_.size(), "closing-edge record");
     if (path_table_.CycleOverflow()) {
-      std::fprintf(stderr, "XBError: cycle buffer full (%zu nodes); raise -p\n", path_table_.BufferCapacity());
+      // the reserve counter kept counting past the capacity: what this step alone asked for
+      const size_t asked = path_table_.BlossomBufferUsed();
+      std::fprintf(stderr, "XBError: cycle buffer full: this step asked for %zu nodes (%.1f GB), capacity %zu nodes (%.1f GB); raise -p\n",
+                   asked, asked * 4e-9, path_table_.BufferCapacity(), path_table_.BufferCapacity() * 4e-9);
       std::exit(4);
     }
     const size_t num_blossom = blossom_offset_list_.size();
