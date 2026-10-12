@@ -146,6 +146,7 @@ public:
   auto end() const { return array_.begin() + counter_.GetD2H(); }
 
   size_t size() const { return counter_.GetD2H(); }
+  size_t capacity() const { return array_.size(); }
 
 private:
   DArray<T> array_;

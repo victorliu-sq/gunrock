@@ -1,7 +1,12 @@
 // X-Blossom++ maximum matching on Gunrock (include/gunrock/algorithms/xblossom.hxx).
 //
 //   xblossom -m <graph.mtx> [-d dataset] [-l block|thread] [-p path_buffer_ratio]
-//            [-M mat|nomat|tuple] [-o odd_node_ratio] [-w warmup] [-r rounds]
+//            [-M mat|nomat] [-T compact|segment] [-o odd_node_ratio] [-w warmup] [-r rounds]
+//
+// -T selects the path table: compact (default; three vertex ids per node) or
+// segment (the explicit segments of the original X-Blossom++). -p sizes the
+// buffers a run materialises: the cycle buffer under mat, and under -T segment
+// also the segment buffer (ratio x n nodes each).
 //
 // Runs warm-up + timed rounds, each a full maximum matching from the empty
 // matching on a fresh engine (only FindMaximumMatch is timed, as XB++), checks
@@ -27,7 +32,7 @@ using namespace memory;
 namespace {
 
 struct options_t {
-  std::string graph, dataset = "unknown", lb = "block", blossom = "mat";
+  std::string graph, dataset = "unknown", lb = "block", blossom = "mat", table = "compact";
   size_t path_buffer_ratio = 1, odd_node_ratio = 30;
   int warmup = 1, rounds = 10;
 };
@@ -41,14 +46,20 @@ options_t parse(int argc, char** argv) {
     else if (k == "-l") o.lb = v;
     else if (k == "-p") o.path_buffer_ratio = std::stoul(v);
     else if (k == "-M") o.blossom = v;
+    else if (k == "-T") o.table = v;
     else if (k == "-o") o.odd_node_ratio = std::stoul(v);
     else if (k == "-w") o.warmup = std::stoi(v);
     else if (k == "-r") o.rounds = std::stoi(v);
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
   }
   if (o.graph.empty()) { std::fprintf(stderr, "usage: xblossom -m <graph.mtx> ...\n"); std::exit(2); }
-  if (o.blossom != "mat" && o.blossom != "nomat" && o.blossom != "tuple") {
-    std::fprintf(stderr, "-M must be mat, nomat or tuple\n");
+  if (o.blossom == "tuple") { o.blossom = "nomat"; o.table = "compact"; } // the earlier spelling of nomat-compact
+  if (o.blossom != "mat" && o.blossom != "nomat") {
+    std::fprintf(stderr, "-M must be mat or nomat\n");
+    std::exit(2);
+  }
+  if (o.table != "compact" && o.table != "segment") {
+    std::fprintf(stderr, "-T must be compact or segment\n");
     std::exit(2);
   }
   return o;
@@ -71,7 +82,7 @@ long check_matching(const std::vector<int>& row, const std::vector<int>& col, co
   return matched / 2;
 }
 
-// path_table_t: the path table as is (-M mat|nomat) or the tuple path table (-M tuple, nomat)
+// path_table_t: the compact path table (-T compact, the default) or the segment path table (-T segment)
 template <operators::load_balance_t LB, typename path_table_t, typename graph_t>
 int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::vector<int>& col) {
   auto context = std::make_shared<gcuda::multi_context_t>(0);
@@ -132,16 +143,16 @@ int main(int argc, char** argv) {
   long max_degree = 0;
   for (size_t v = 0; v + 1 < row.size(); v++) max_degree = std::max<long>(max_degree, row[v + 1] - row[v]);
 
-  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s dataset=%s nodes=%d edges=%ld "
+  std::printf("XBConfig: arm=gunrock variant=xb-pp-gunrock reuse=1 lb=%s blossom=%s path_table=%s dataset=%s nodes=%d edges=%ld "
               "max_degree=%ld warmup=%d rounds=%d path_buffer_ratio=%zu odd_node_ratio=%zu\n",
-              o.lb.c_str(), o.blossom == "tuple" ? "nomat-tuple" : o.blossom.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
+              o.lb.c_str(), o.blossom.c_str(), o.table.c_str(), o.dataset.c_str(), G.get_number_of_vertices(),
               static_cast<long>(G.get_number_of_edges()) / 2, max_degree, o.warmup, o.rounds,
               o.path_buffer_ratio, o.odd_node_ratio);
   std::fflush(stdout);
 
   using table_t = zblossom::dev::PathTable;
   using tuple_t = zblossom::dev::TuplePathTable;
-  const bool tuple = o.blossom == "tuple";
+  const bool tuple = o.table == "compact";
   if (o.lb == "block")
     return tuple ? run<operators::load_balance_t::block_mapped, tuple_t>(G, o, row, col)
                  : run<operators::load_balance_t::block_mapped, table_t>(G, o, row, col);

@@ -71,8 +71,10 @@ __device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, f
   });
 }
 
-// path_table_t: zblossom::dev::PathTable (the path table as is, mat or nomat)
-// or zblossom::dev::TuplePathTable (three vertex ids per node, nomat only).
+// path_table_t: zblossom::dev::TuplePathTable (the compact path table, three
+// vertex ids per node; the default) or zblossom::dev::PathTable (the segment
+// path table). Both run mat and nomat; mat on the compact table materialises
+// the cycles from the records (TuplePathTableView::MaterializeCycle).
 template <operators::load_balance_t LB, typename graph_t, typename path_table_t = zblossom::dev::PathTable>
 class engine_t {
   static constexpr bool kTuple = std::is_same<path_table_t, zblossom::dev::TuplePathTable>::value;
@@ -92,7 +94,7 @@ class engine_t {
         nomat_(nomat),
         nnodes_(G.get_number_of_vertices()),
         dev_matching_(nnodes_, nnodes_),
-        path_table_(nnodes_, path_table_buffer_ratio),
+        path_table_(nnodes_, path_table_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
         is_even_(nnodes_),
         tree_roots_(nnodes_),
         blossom_to_base_(nnodes_),
@@ -440,7 +442,6 @@ class engine_t {
       return;
     }
 
-    if constexpr (!kTuple) {
     // mat (as is): find the blossoms closed by frontier edges, each materialised in the blossom buffer
     Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
       auto matching = matching_v;
@@ -459,8 +460,12 @@ class engine_t {
         offset_t blossom_offset;
         size_t nnodes_in_blossom;
         index_t v_idx_in_blossom;
-        path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
-                                                                       v_idx_in_blossom);
+        if constexpr (kTuple) {
+          path_table.MaterializeCycle(v, w, matching, blossom_offset, nnodes_in_blossom, v_idx_in_blossom);
+        } else {
+          path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
+                                                                         v_idx_in_blossom);
+        }
         size_t num_odd_vside = v_idx_in_blossom >> 1;
         size_t num_odd = (nnodes_in_blossom - 2) >> 1;
         if (num_odd == 0) return false;
@@ -504,21 +509,30 @@ class engine_t {
       index_t delta = static_cast<index_t>(static_cast<offset_t>(tid) - psum[b]);
       int is_vside = delta <= (num_odd_vside - 1);
       index_t odd_idx = 1 + 2 * delta + (1 - is_vside);
-      index_t odd_node = path_table.GetNodeFromBlossomInBlossomBuffer(blossom_offset, odd_idx);
+      index_t odd_node;
+      if constexpr (kTuple) {
+        odd_node = path_table.CycleNode(blossom_offset, odd_idx);
+      } else {
+        odd_node = path_table.GetNodeFromBlossomInBlossomBuffer(blossom_offset, odd_idx);
+      }
       if (!is_even[odd_node] && path_table.IsPathEmpty(odd_node) &&
           atomicExch(&locks[odd_node], DFLAG_TRUE) == DFLAG_FALSE) {
         int step = is_vside ? +1 : -1;
         index_t start_idx = odd_idx + step;
         size_t path_len = is_vside ? (nnodes_in_blossom - odd_idx - 1) : static_cast<size_t>(odd_idx);
-        if (path_table.CheckPathDuplicationInBlossomBufferDirectional(blossom_offset, start_idx, path_len, step))
-          return;
-        path_table.ExpandNodesFromBlossomDirectional(odd_node, blossom_offset, nnodes_in_blossom, start_idx,
-                                                     path_len, step);
+        if constexpr (kTuple) {
+          if (path_table.CycleSpanHasDuplicate(blossom_offset, start_idx, path_len, step)) return;
+          path_table.ConvertFromCycle(blossom_offset, 2 * num_odd_vside, odd_idx, step);
+        } else {
+          if (path_table.CheckPathDuplicationInBlossomBufferDirectional(blossom_offset, start_idx, path_len, step))
+            return;
+          path_table.ExpandNodesFromBlossomDirectional(odd_node, blossom_offset, nnodes_in_blossom, start_idx,
+                                                       path_len, step);
+        }
         atomicExch(&is_even[odd_node], 1);
         queue.AppendENode2(odd_node);
       }
     });
-    }
   }
 };
 

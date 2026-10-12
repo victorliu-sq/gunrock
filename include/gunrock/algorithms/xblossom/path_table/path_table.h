@@ -189,6 +189,9 @@ namespace zblossom {
         }
       }
 
+      // the table-agnostic constructor of the engine (the flag selects mat on the compact table only)
+      explicit PathTable(size_t nnnodes, size_t buffer_ratio, bool /*mat*/) : PathTable(nnnodes, buffer_ratio) {}
+
       explicit PathTable(size_t nnnodes, size_t buffer_ratio)
         : nnnodes_(nnnodes),
           path_buffer_size_(buffer_ratio * nnnodes),
