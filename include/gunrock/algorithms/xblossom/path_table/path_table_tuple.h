@@ -55,6 +55,10 @@ namespace zblossom {
 
       // buffer_ratio sizes the cycle buffer (ratio x n nodes) under mat; nomat
       // keeps the records alone
+      // the engine's table-agnostic constructor (no segment buffer here)
+      explicit TuplePathTable(size_t nnnodes, size_t cycle_ratio, size_t /*segment_ratio*/, bool mat)
+        : TuplePathTable(nnnodes, cycle_ratio, mat) {}
+
       explicit TuplePathTable(size_t nnnodes, size_t buffer_ratio, bool mat = false)
         : nnnodes_(nnnodes), mat_(mat), rec_(3 * nnnodes), rd_(mat ? nnnodes : 1),
           cycles_(mat ? buffer_ratio * nnnodes : 1), flip_stack_peak_(), cycle_overflow_() {

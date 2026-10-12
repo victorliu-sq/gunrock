@@ -92,14 +92,16 @@ class engine_t {
   // its chains and made even from the path table (X-Blossom++'s XB_BLOSSOM_MAT 1);
   // odd_node_ratio sizes the blossom lists (records under mat, tasks under nomat),
   // in entries per node; it may be fractional (nomat needs well under one per node).
-  engine_t(graph_t& G, size_t path_table_buffer_ratio, double odd_node_ratio, bool nomat,
+  // path_table_buffer_ratio sizes the cycle buffer (mat), segment_buffer_ratio
+  // the segment table's buffer (-T segment); both x n nodes.
+  engine_t(graph_t& G, size_t path_table_buffer_ratio, size_t segment_buffer_ratio, double odd_node_ratio, bool nomat,
            std::shared_ptr<gcuda::multi_context_t> context)
       : G_(G),
         context_(context),
         nomat_(nomat),
         nnodes_(G.get_number_of_vertices()),
         dev_matching_(nnodes_, nnodes_),
-        path_table_(nnodes_, path_table_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
+        path_table_(nnodes_, path_table_buffer_ratio, segment_buffer_ratio, !nomat), // the compact table keeps a cycle buffer under mat only
         is_even_(nnodes_),
         tree_roots_(nnodes_),
         atomic_locks_tree_(nnodes_),

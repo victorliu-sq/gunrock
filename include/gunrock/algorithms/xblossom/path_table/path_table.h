@@ -192,6 +192,17 @@ namespace zblossom {
       // the table-agnostic constructor of the engine (the flag selects mat on the compact table only)
       explicit PathTable(size_t nnnodes, size_t buffer_ratio, bool /*mat*/) : PathTable(nnnodes, buffer_ratio) {}
 
+      // The cycle (blossom) buffer and the segment buffer sized apart: their
+      // peaks differ by up to two orders of magnitude (Orkut: about 940 vs 16
+      // nodes per vertex), so one ratio for both wastes most of the memory
+      explicit PathTable(size_t nnnodes, size_t cycle_ratio, size_t segment_ratio, bool /*mat*/)
+        : nnnodes_(nnnodes),
+          path_buffer_size_(segment_ratio * nnnodes),
+          paths_(path_buffer_size_),
+          offset_length_(nnnodes),
+          root_distance_(nnnodes),
+          blossom_buffer_(cycle_ratio * nnnodes) {}
+
       explicit PathTable(size_t nnnodes, size_t buffer_ratio)
         : nnnodes_(nnnodes),
           path_buffer_size_(buffer_ratio * nnnodes),
