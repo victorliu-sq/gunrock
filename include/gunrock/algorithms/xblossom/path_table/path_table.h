@@ -255,7 +255,7 @@ namespace zblossom {
         thrust::copy_n(blossom_buffer_.begin(), out.size(), out.begin());
       }
       size_t BlossomBufferUsed() const { return blossom_buffer_.size(); }
-      size_t BufferCapacity() const { return path_buffer_size_; }
+      size_t BufferCapacity() const { return blossom_buffer_.capacity(); } // the cycle buffer (-p), not the segment buffer (-q)
       size_t FixedBytes() const { return nnnodes_ * (sizeof(OffsetLength) + sizeof(index_t)); }
       int FlipStackPeak() const { return 0; }
       // a closing edge's cycle (or, under the original base identification, its
@@ -558,17 +558,11 @@ namespace zblossom {
         if (!ReserveOrFlag(nnnodes_v_root + nnode_w_root, path_v_offset)) return false;
         offset_t path_w_offset = path_v_offset + nnnodes_v_root;
 
-        // 1-3 Traverse path v to root and store it in paths_buffer
+        // 1-3 Traverse path v to root and store it in the blossom buffer; ReserveOrFlag
+        // guaranteed the room (a stale check here against the segment buffer's size printed
+        // millions of lines per round)
         offset_t buffer_idx_v = path_v_offset;
         index_t cur_v = v;
-        // add v to path buffer
-
-        // TODO: save the space for blossom buffer
-        if (buffer_idx_v > path_buffer_size_) {
-          printf("[ERROR]: buffer_idx_v is %d, whereas path_buffer_size is %lu\n", buffer_idx_v, path_buffer_size_);
-          assert(false);
-        }
-
         blossom_buffer_[buffer_idx_v++] = cur_v;
 
         OffsetLength offset_length = LoadOL(cur_v);
