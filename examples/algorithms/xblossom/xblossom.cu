@@ -21,6 +21,8 @@
 //   XBPhases: index aug_path_s expand_s blossom_s steps   per timed round
 //   XBMemory: index paths_used blossom_buffer_peak blossom_list_peak buffer_capacity list_capacity
 //             transform_tasks_peak table_bytes flip_stack_peak
+//   XBCounters: index blossoms steps                    per timed round, with -c 1
+//             (blossoms: closing edges whose base was identified)
 //   XBResult: status matching_size valid rounds mean_runtime_s
 #include <gunrock/algorithms/xblossom.hxx>
 
@@ -41,6 +43,7 @@ struct options_t {
   size_t path_buffer_ratio = 1, segment_buffer_ratio = 0; // 0: as -p
   double odd_node_ratio = 30; // blossom-list entries per node; may be fractional
   int warmup = 1, rounds = 10;
+  int counters = 0; // -c 1: count blossoms (an atomic per closing edge; keep it off for timing)
 };
 
 options_t parse(int argc, char** argv) {
@@ -58,6 +61,7 @@ options_t parse(int argc, char** argv) {
     else if (k == "-o") o.odd_node_ratio = std::stod(v);
     else if (k == "-w") o.warmup = std::stoi(v);
     else if (k == "-r") o.rounds = std::stoi(v);
+    else if (k == "-c") o.counters = std::stoi(v);
     else { std::fprintf(stderr, "unknown option %s\n", k.c_str()); std::exit(2); }
   }
   if (o.graph.empty()) { std::fprintf(stderr, "usage: xblossom -m <graph.mtx> ...\n"); std::exit(2); }
@@ -110,6 +114,7 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
                                                          o.segment_buffer_ratio ? o.segment_buffer_ratio : o.path_buffer_ratio,
                                                          o.odd_node_ratio,
                                                          o.blossom != "mat", context, o.base == "rootpath");
+    if (o.counters) engine.EnableCounters();
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<index_t> mate = engine.FindMaximumMatch();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
@@ -131,6 +136,7 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
                 i - o.warmup, engine.PathsUsed(), engine.PeakBlossomBufferNodes(), engine.PeakBlossomListEntries(),
                 engine.BufferCapacity(), engine.BlossomListCapacity(), engine.PeakTransformTasks(),
                 engine.PathTableFixedBytes(), engine.FlipStackPeak());
+    if (o.counters) std::printf("XBCounters: index=%d blossoms=%zu steps=%zu\n", i - o.warmup, engine.Blossoms(), engine.Steps());
     std::fflush(stdout);
   }
   const char* status = !all_valid ? "invalid_matching" : (!all_same ? "matching_size_varies" : "ok");

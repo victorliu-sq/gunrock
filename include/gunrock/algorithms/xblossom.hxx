@@ -164,6 +164,10 @@ class engine_t {
   size_t PathTableFixedBytes() const { return path_table_.FixedBytes(); }
   int FlipStackPeak() const { return path_table_.FlipStackPeak(); }
   size_t BlossomListCapacity() const { return num_odd_nodes_in_blossom_list_.size(); }
+  // Counters (EnableCounters, driver -c 1): blossoms, counted as the closing edges whose
+  // base was identified (one record per closing edge under mat, one base walk under nomat)
+  void EnableCounters() { count_ = true; }
+  size_t Blossoms() const { return blossoms_; }
 
   // Public: nvcc requires the enclosing function of an extended __device__
   // lambda to be public.
@@ -174,11 +178,14 @@ class engine_t {
   size_t nnodes_;
   double t_aug_{0}, t_expand_{0}, t_blossom_{0};
   size_t steps_{0}, peak_buffer_{0}, peak_list_{0}, peak_tasks_{0};
+  bool count_{false};
+  size_t blossoms_{0};
   int found_{DFLAG_FALSE};
   int exhausted_{DFLAG_FALSE};
 
   DArray<index_t> dev_matching_;
   DValue<DFlag> dev_found_;
+  DValue<unsigned long long> dev_blossoms_; // counter builds: closing edges of this step (nomat)
   path_table_t path_table_;
   DArray<DFlag> is_even_;
   DArray<index_t> tree_roots_;
@@ -422,6 +429,9 @@ class engine_t {
     if (nomat_) {
       // nomat: find the base, claim the odd nodes still odd on both chains
       // (the lists hold: node, s, o, base), no cycle written
+      const bool count = count_;
+      if (count) dev_blossoms_.SetH2D(0);
+      auto blossoms_v = dev_blossoms_.DeviceView();
       Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
         auto matching = matching_v;
         auto path_table = path_table_v;
@@ -437,11 +447,13 @@ class engine_t {
         if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
           index_t base;
           path_table.FindBlossomBaseByAnchorNode(v, w, base);
+          if (count) atomicAdd(&blossoms_v, 1ULL);
           ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, v, w, base);
           ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, w, v, base);
         }
         return false;
       });
+      if (count) blossoms_ += dev_blossoms_.GetD2H();
       const size_t num_tasks = blossom_offset_list_.size();
       CheckListFits(num_tasks, "odd-node task");
       peak_list_ = std::max(peak_list_, num_tasks);
@@ -521,6 +533,7 @@ class engine_t {
       std::exit(4);
     }
     const size_t num_blossom = blossom_offset_list_.size();
+    if (count_) blossoms_ += num_blossom;
     peak_list_ = std::max(peak_list_, num_blossom);
     peak_buffer_ = std::max(peak_buffer_, path_table_.BlossomBufferUsed());
     CUDA_CHECK(cub::DeviceScan::ExclusiveSum(thrust::raw_pointer_cast(scan_temp_.data()), scan_temp_bytes_,
