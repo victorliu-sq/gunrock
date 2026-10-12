@@ -66,7 +66,7 @@ __device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, f
     for (index_t i = 0; i + 1 < ol.second; i++) {
       const index_t n = path_table.LoadPath(ol.first + i);
       if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
-        const index_t t = task_node.Append(n);
+        const offset_t t = task_node.Append(n);
         task_s[t] = s;
         task_o[t] = o;
         task_base[t] = base;
@@ -171,7 +171,7 @@ class engine_t {
   DArray<DAtomicFlag> atomic_locks_odd_nodes_;
   zblossom::ENodeQueue enode_queue_;
 
-  DList<index_t> blossom_offset_list_;
+  DList<offset_t> blossom_offset_list_; // cycle offsets (mat) or odd-node tasks (nomat)
   DArray<index_t> num_nodes_in_blossom_list_;
   DArray<index_t> num_odd_nodes_vside_in_blossom_list_;
   DArray<index_t> num_odd_nodes_in_blossom_list_;
@@ -454,7 +454,7 @@ class engine_t {
       index_t root_v = tree_roots[v];
       index_t root_w = tree_roots[w];
       if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
-        index_t blossom_offset;
+        offset_t blossom_offset;
         size_t nnodes_in_blossom;
         index_t v_idx_in_blossom;
         path_table.FindAndAddBlossomImplicitByAnchorNodeInBlossomBuffer(v, w, blossom_offset, nnodes_in_blossom,
@@ -462,7 +462,7 @@ class engine_t {
         size_t num_odd_vside = v_idx_in_blossom >> 1;
         size_t num_odd = (nnodes_in_blossom - 2) >> 1;
         if (num_odd == 0) return false;
-        index_t slot = blossom_offsets.Append(blossom_offset);
+        offset_t slot = blossom_offsets.Append(blossom_offset);
         nodes_in_blossom[slot] = nnodes_in_blossom;
         odd_in_blossom[slot] = num_odd;
         odd_vside_in_blossom[slot] = num_odd_vside;
@@ -495,7 +495,7 @@ class engine_t {
       auto odd_vside_in_blossom = odd_vside_in_blossom_v;
       auto psum = psum_v;
       index_t b = FindRightmostLTEQ(psum, num_blossom + 1, tid);
-      index_t blossom_offset = blossom_offsets[b];
+      offset_t blossom_offset = blossom_offsets[b];
       index_t nnodes_in_blossom = nodes_in_blossom[b];
       index_t num_odd_vside = odd_vside_in_blossom[b];
       index_t delta = tid - psum[b];

@@ -7,6 +7,9 @@
 #include <vector>
 
 using index_t = int;
+// Offsets into the path buffer, the cycle buffer and the blossom lists: 64-bit,
+// so a cycle buffer may exceed 2^31 entries (int32 offsets could not run Orkut).
+using offset_t = long long;
 using byte_t = uint8_t;
 
 template<typename T>

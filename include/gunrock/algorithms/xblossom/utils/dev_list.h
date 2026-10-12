@@ -15,27 +15,33 @@ using HList = HVector<T>;
 template<typename T>
 class DListView {
 public:
-  DEV_HOST_INLINE DListView(DArrayView<T> array_view, DValueView<index_t> counter)
+  DEV_HOST_INLINE DListView(DArrayView<T> array_view, DValueView<offset_t> counter)
     : array_(array_view), counter_(counter) {
   }
 
-  DEV_INLINE index_t Append(T val) {
-    auto idx = atomicAdd(&counter_, 1);
+  // 64-bit atomics on the counter (CUDA has them for unsigned long long only)
+  static DEV_INLINE offset_t AtomicAdd(offset_t *p, offset_t v) {
+    return static_cast<offset_t>(atomicAdd(reinterpret_cast<unsigned long long *>(p),
+                                           static_cast<unsigned long long>(v)));
+  }
+
+  DEV_INLINE offset_t Append(T val) {
+    auto idx = AtomicAdd(&counter_, 1);
     assert(static_cast<size_t>(idx) < array_.size()); // list capacity exceeded
     array_[idx] = val;
     return idx;
   }
 
-  DEV_INLINE index_t AppendWarp(T val) {
+  DEV_INLINE offset_t AppendWarp(T val) {
     auto g = cooperative_groups::coalesced_threads();
 
     // 1. No need to gather, number of active thread is already provided.
     // Thread 0 only needs to perform atomicAdd to get the base offset
-    index_t base_offset;
-    index_t thread_offset;
-    const index_t first_active_thread_rank = 0;
+    offset_t base_offset;
+    offset_t thread_offset;
+    const offset_t first_active_thread_rank = 0;
     if (g.thread_rank() == first_active_thread_rank) {
-      base_offset = atomicAdd(&counter_, g.size());
+      base_offset = AtomicAdd(&counter_, g.size());
     }
 
     // 2. Scatter base offset to all active threads in the warp.
@@ -46,21 +52,21 @@ public:
     return thread_offset;
   }
 
-  DEV_INLINE index_t Reserve(size_t size) {
-    index_t offset = atomicAdd(&counter_, size);
+  DEV_INLINE offset_t Reserve(size_t size) {
+    offset_t offset = AtomicAdd(&counter_, static_cast<offset_t>(size));
     assert(static_cast<size_t>(offset) + size <= array_.size()); // buffer capacity exceeded
     return offset;
   }
 
-  DEV_INLINE index_t ReserveWarp(size_t size) {
+  DEV_INLINE offset_t ReserveWarp(size_t size) {
     auto warp = cooperative_groups::coalesced_threads();
 
     // 1. Thread 0 in the warp gathers all sizes and perform atomicAdd
-    const index_t first_active_thread_rank = 0;
+    const offset_t first_active_thread_rank = 0;
 
-    index_t total_size = 0;
+    offset_t total_size = 0;
 
-    const index_t thread_rank = warp.thread_rank();
+    const offset_t thread_rank = warp.thread_rank();
 
     // printf("[Warp] Thread %d: Starting ReserveWarp with size %d\n", warp.thread_rank(), thread_size);
 
@@ -71,19 +77,19 @@ public:
       total_size += warp.shfl(thread_size, i);
     }
 
-    index_t base_offset = 0;
+    offset_t base_offset = 0;
     if (thread_rank == first_active_thread_rank) {
-      base_offset = atomicAdd(&counter_, total_size);
+      base_offset = AtomicAdd(&counter_, total_size);
     }
 
     // 2. Scatter the base offset to all active threads
     base_offset = warp.shfl(base_offset, first_active_thread_rank);
     // 3. Compute individual offset by accumulation for each thread
-    index_t thread_offset = base_offset;
+    offset_t thread_offset = base_offset;
 
     #pragma unroll
     for (int i = 0; i < warp.size(); i++) {
-      index_t val = warp.shfl(thread_size, i);
+      offset_t val = warp.shfl(thread_size, i);
       thread_offset += (i < thread_rank) ? val : 0;
     }
 
@@ -92,26 +98,26 @@ public:
     return thread_offset;
   }
 
-  DEV_INLINE T &operator[](index_t idx) {
+  DEV_INLINE T &operator[](offset_t idx) {
     // assert(idx < Size());
     assert(idx < this->array_.size());
     return array_[idx];
   }
 
-  DEV_INLINE const T &operator[](index_t idx) const {
+  DEV_INLINE const T &operator[](offset_t idx) const {
     // assert(idx < Size());
     assert(idx < this->array_.size());
     return array_[idx];
   }
 
-  // DEV_INLINE index_t Size() const {
-  //   return atomicAdd(const_cast<index_t*>(&counter_), 0);
+  // DEV_INLINE offset_t Size() const {
+  //   return atomicAdd(const_cast<offset_t*>(&counter_), 0);
   //   // return *counter_;
   // }
 
 private:
   DArrayView<T> array_;
-  DValueView<index_t> counter_;
+  DValueView<offset_t> counter_;
 };
 
 template<typename T>
@@ -143,7 +149,7 @@ public:
 
 private:
   DArray<T> array_;
-  DValue<index_t> counter_;
+  DValue<offset_t> counter_;
 };
 
 #endif //DEV_LIST_H
