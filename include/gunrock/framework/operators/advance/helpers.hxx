@@ -83,6 +83,12 @@ std::size_t compute_output_offsets(graph_t& G,
   auto location_of_total_scanned_items =
       thrust::distance(segments.begin(), new_length) - 1;
 
+  // The scan ran with par_nosync on the context's non-blocking stream, and the
+  // host_vector copy below goes through the legacy default stream, which does
+  // not wait for it: without this the copy can read the total before the scan
+  // writes it (0), and merge_path then issues no work at all.
+  context.synchronize();
+
   // Move the last element of the scanned work-domain to host.
   // Last Element = size of active buffer - 1;
   // If the active buffer is greater than number of vertices,

@@ -3,6 +3,7 @@
 #include <gunrock/io/parameters.hxx>
 #include <gunrock/util/performance.hxx>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -13,6 +14,7 @@ using namespace memory;
 struct normalized_args_t {
   std::vector<std::string> storage;
   std::vector<char*> argv;
+  std::string source_file;  // --src-file <path>: the fixed source set, one vertex per line
 };
 
 normalized_args_t normalize_multi_sssp_args(int argc, char** argv) {
@@ -21,7 +23,13 @@ normalized_args_t normalize_multi_sssp_args(int argc, char** argv) {
 
   for (int i = 0; i < argc; i++) {
     std::string arg = argv[i];
-    if (arg == "--src" || arg == "-s") {
+    if (arg == "--src-file") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --src-file requires a path" << std::endl;
+        std::exit(1);
+      }
+      normalized.source_file = argv[++i];
+    } else if (arg == "--src" || arg == "-s") {
       std::string sources = "--src=";
       bool has_source = false;
       i++;
@@ -88,7 +96,27 @@ void test_multi_sssp(int num_arguments, char** argument_array) {
               << std::endl;
     std::exit(1);
   }
-  if (params.source_count >= 0) {
+  if (!normalized_args.source_file.empty()) {
+    if (params.source_count >= 0 || !params.source_string.empty()) {
+      std::cerr << "Error: use --src-file alone" << std::endl;
+      std::exit(1);
+    }
+    std::ifstream in(normalized_args.source_file);
+    if (!in) {
+      std::cerr << "Error: cannot open --src-file " << normalized_args.source_file << std::endl;
+      std::exit(1);
+    }
+    std::string line;
+    while (std::getline(in, line)) {
+      if (line.empty() || line[0] == '#') continue;
+      int v = std::stoi(line);
+      if (v < 0 || (size_t)v >= n_vertices) {
+        std::cerr << "Error: source " << v << " out of range" << std::endl;
+        std::exit(1);
+      }
+      source_vect.push_back(v);
+    }
+  } else if (params.source_count >= 0) {
     gunrock::io::cli::generate_unique_random_sources(
         params.source_count, &source_vect, n_vertices);
   } else {

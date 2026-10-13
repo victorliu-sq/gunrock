@@ -200,9 +200,9 @@ int main(int argc, char** argv) {
   if (o.lb == "thread")
     return tuple ? run<operators::load_balance_t::thread_mapped, tuple_t>(G, o, row, col)
                  : run<operators::load_balance_t::thread_mapped, table_t>(G, o, row, col);
-  // merge_path is left out: on this Gunrock build it issues no work for these
-  // advances (no error, the operator is never called), and none of Gunrock's
-  // own algorithms here use it.
-  std::fprintf(stderr, "-l must be block or thread\n");
+  if (o.lb == "merge")  // merge_path: Gunrock's edge-balanced advance (moderngpu load-balancing search)
+    return tuple ? run<operators::load_balance_t::merge_path, tuple_t>(G, o, row, col)
+                 : run<operators::load_balance_t::merge_path, table_t>(G, o, row, col);
+  std::fprintf(stderr, "-l must be block, thread or merge\n");
   return 2;
 }
