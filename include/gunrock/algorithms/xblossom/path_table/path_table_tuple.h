@@ -64,7 +64,20 @@ namespace zblossom {
           cycles_(mat ? buffer_ratio * nnnodes : 1), flip_stack_peak_(), cycle_overflow_() {
         flip_stack_peak_.SetH2D(0);
         cycle_overflow_.SetH2D(0);
+        ResetCounters();
       }
+
+      // Traversal counters (GACGE_TRAVERSAL_STATS; an atomic per base walk and
+      // per augmenting path, so off by default): base walks and their lockstep
+      // steps, augmenting paths and the matched pairs they flip
+      void EnableCounters(bool on = true) { count_ = on; }
+      void ResetCounters() {
+        for (auto *c : {&walks_, &walk_steps_, &paths_, &path_flips_}) c->SetH2D(0);
+      }
+      unsigned long long BaseWalks() const { return walks_.GetD2H(); }
+      unsigned long long BaseWalkSteps() const { return walk_steps_.GetD2H(); }
+      unsigned long long AugmentingPaths() const { return paths_.GetD2H(); }
+      unsigned long long AugmentingPathFlips() const { return path_flips_.GetD2H(); }
 
       void ResetPathTable() { rec_.Fill(static_cast<index_t>(nnnodes_)); }
       void ResetBlossomBuffer() { if (mat_) cycles_.Clear(); }
@@ -91,15 +104,20 @@ namespace zblossom {
       DList<index_t> cycles_; // mat: the materialised cycles of one step
       DValue<int> flip_stack_peak_;
       DValue<int> cycle_overflow_;
+      bool count_{false};
+      DValue<unsigned long long> walks_, walk_steps_, paths_, path_flips_;
     };
 
     class TuplePathTableView {
     public:
       DEV_HOST_INLINE
       TuplePathTableView(size_t nnnodes, bool mat, DArrayView<index_t> rec, DArrayView<index_t> rd,
-                         DListView<index_t> cycles, DValueView<int> flip_stack_peak, DValueView<int> cycle_overflow)
+                         DListView<index_t> cycles, DValueView<int> flip_stack_peak, DValueView<int> cycle_overflow,
+                         bool count, DValueView<unsigned long long> walks, DValueView<unsigned long long> walk_steps,
+                         DValueView<unsigned long long> paths, DValueView<unsigned long long> path_flips)
         : nnnodes_(nnnodes), none_(static_cast<index_t>(nnnodes)), mat_(mat), rec_(rec), rd_(rd),
-          cycles_(cycles), flip_stack_peak_(flip_stack_peak), cycle_overflow_(cycle_overflow) {
+          cycles_(cycles), flip_stack_peak_(flip_stack_peak), cycle_overflow_(cycle_overflow), count_(count),
+          walks_(walks), walk_steps_(walk_steps), paths_(paths), path_flips_(path_flips) {
       }
 
       struct Rec {
@@ -200,13 +218,16 @@ namespace zblossom {
       DEV_INLINE void FindBlossomBaseByAnchorNode(index_t v, index_t w, index_t &blossom_base) const {
         index_t cur_v = v, cur_w = w;
         Rec rv = Load(cur_v), rw = Load(cur_w);
+        unsigned long long steps = 0;
         while (cur_v != cur_w) {
           if (IsEmpty(rv)) { cur_v = w; } else { cur_v = Anchor(rv); }
           rv = Load(cur_v);
           if (IsEmpty(rw)) { cur_w = v; } else { cur_w = Anchor(rw); }
           rw = Load(cur_w);
+          steps++;
         }
         blossom_base = cur_v;
+        if (count_) { atomicAdd(&walks_, 1ULL); atomicAdd(&walk_steps_, steps); }
       }
 
       // f(n) for every node n that was odd when it was recorded, on s's
@@ -227,9 +248,11 @@ namespace zblossom {
       DEV_INLINE void AddAugmentingPath(index_t v, index_t w, DArrayView<index_t> matching) {
         atomicExch(&matching[v], w);
         atomicExch(&matching[w], v);
-        FlipRoute(v, matching);
-        FlipRoute(w, matching);
+        unsigned long long flips = 0;
+        FlipRoute(v, matching, flips);
+        FlipRoute(w, matching, flips);
         __threadfence();
+        if (count_) { atomicAdd(&paths_, 1ULL); atomicAdd(&path_flips_, flips); }
       }
 
     private:
@@ -292,7 +315,7 @@ namespace zblossom {
       // an anchor and continues as route(base), so "route(o) up to this walk's
       // stop" is the rest of the walk. The walk of route(s) before u is done
       // first, the walk of route(o) kept on a stack (one entry per nesting level)
-      DEV_INLINE void FlipRoute(index_t x, DArrayView<index_t> &matching) {
+      DEV_INLINE void FlipRoute(index_t x, DArrayView<index_t> &matching, unsigned long long &flips) {
         Walk stack[XB_TUPLE_FLIP_STACK];
         int depth = 0, peak = 0;
         Walk cur{x, none_};
@@ -304,12 +327,14 @@ namespace zblossom {
             if (IsTwo(r)) {
               if (cur.stop < 0 && r.a == ~cur.stop) break; // the odd stop
               Flip(r.a, r.b, matching);
+              flips++;
               cur.x = r.b;
             } else {
               assert(depth < XB_TUPLE_FLIP_STACK);
               stack[depth++] = Walk{r.b, cur.stop};
               if (depth > peak) peak = depth;
               Flip(r.a, r.b, matching);
+              flips++;
               cur = Walk{r.a, ~cur.x}; // route(s) before u
             }
           }
@@ -327,11 +352,15 @@ namespace zblossom {
       DListView<index_t> cycles_;
       DValueView<int> flip_stack_peak_;
       DValueView<int> cycle_overflow_;
+      bool count_;
+      DValueView<unsigned long long> walks_, walk_steps_, paths_, path_flips_;
     };
 
     inline TuplePathTableView TuplePathTable::DeviceView() {
       return TuplePathTableView(nnnodes_, mat_, rec_.DeviceView(), rd_.DeviceView(), cycles_.DeviceView(),
-                                flip_stack_peak_.DeviceView(), cycle_overflow_.DeviceView());
+                                flip_stack_peak_.DeviceView(), cycle_overflow_.DeviceView(), count_,
+                                walks_.DeviceView(), walk_steps_.DeviceView(), paths_.DeviceView(),
+                                path_flips_.DeviceView());
     }
   }
 }

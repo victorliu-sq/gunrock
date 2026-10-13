@@ -14,6 +14,7 @@
 
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
+#include <thrust/functional.h>
 #include <thrust/transform_reduce.h>
 
 #include <gunrock/cuda/cuda.hxx>
@@ -232,20 +233,20 @@ struct enactor_t {
    * @brief The active frontier's valid vertices and the edges they will
    * examine (the sum of their degrees), for GACGE_TRAVERSAL_STATS.
    */
-  void traversal_frontier_work(std::size_t& fv, std::size_t& fe) {
+  void traversal_frontier_work(std::size_t& fv, std::size_t& fe, std::size_t& max_deg) {
     auto f = get_input_frontier();
     auto n = f->get_number_of_elements();
-    fv = fe = 0;
+    fv = fe = max_deg = 0;
     if (n == 0)
       return;
     auto g = problem->get_graph();
     auto first = f->begin();
-    fe = thrust::transform_reduce(
-        thrust::device, first, first + n,
-        [g] __device__(vertex_t const& v) -> std::size_t {
-          return gunrock::util::limits::is_valid(v) ? (std::size_t)g.get_number_of_neighbors(v) : 0;
-        },
-        std::size_t(0), thrust::plus<std::size_t>());
+    auto deg = [g] __device__(vertex_t const& v) -> std::size_t {
+      return gunrock::util::limits::is_valid(v) ? (std::size_t)g.get_number_of_neighbors(v) : 0;
+    };
+    fe = thrust::transform_reduce(thrust::device, first, first + n, deg, std::size_t(0), thrust::plus<std::size_t>());
+    max_deg = thrust::transform_reduce(thrust::device, first, first + n, deg, std::size_t(0),
+                                       thrust::maximum<std::size_t>());
     fv = thrust::count_if(thrust::device, first, first + n,
                           [] __device__(vertex_t const& v) { return gunrock::util::limits::is_valid(v); });
   }
@@ -281,19 +282,21 @@ struct enactor_t {
     const bool stats = std::getenv("GACGE_TRAVERSAL_STATS") != nullptr;
     const char* trace_env = std::getenv("GACGE_TRAVERSAL_TRACE");
     const bool trace = stats && enact_index == (trace_env ? std::atoi(trace_env) : 1);
-    std::size_t t_steps = 0, t_v = 0, t_e = 0, t_max_e = 0, t_small = 0;
+    std::size_t t_steps = 0, t_v = 0, t_e = 0, t_max_e = 0, t_small = 0, t_imb_n = 0;
+    double t_imb = 0;  // sum over steps of max degree / mean degree of the frontier
     auto timer = single_context->timer();
     timer.begin();
     while (!is_converged(*context)) {
       if (stats) {
-        std::size_t fv = 0, fe = 0;
-        traversal_frontier_work(fv, fe);
+        std::size_t fv = 0, fe = 0, md = 0;
+        traversal_frontier_work(fv, fe, md);
         t_steps++; t_v += fv; t_e += fe;
         t_max_e = fe > t_max_e ? fe : t_max_e;
         t_small += fe < 65536;
+        if (fe > 0) { t_imb += (double)md * (double)fv / (double)fe; t_imb_n++; }
         if (trace)
-          std::printf("XBStep: run=%d step=%zu phase=advance frontier_v=%zu frontier_e=%zu\n", enact_index,
-                      t_steps - 1, fv, fe);
+          std::printf("XBStep: run=%d step=%zu phase=advance frontier_v=%zu frontier_e=%zu max_deg=%zu\n",
+                      enact_index, t_steps - 1, fv, fe, md);
       }
       loop(*context);
       ++iteration;
@@ -302,8 +305,8 @@ struct enactor_t {
     auto runtime = timer.end();
     if (stats)
       std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
-                  "nodes=%zu edges=%zu\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,
-                  (std::size_t)problem->get_graph().get_number_of_vertices(),
+                  "imbalance=%.3f nodes=%zu edges=%zu\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,
+                  t_imb_n ? t_imb / t_imb_n : 0.0, (std::size_t)problem->get_graph().get_number_of_vertices(),
                   (std::size_t)problem->get_graph().get_number_of_edges());
 #if (ESSENTIALS_COLLECT_METRICS)
     benchmark::____.search_depth = iteration;

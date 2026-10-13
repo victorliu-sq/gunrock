@@ -29,6 +29,7 @@
 #include <gunrock/algorithms/algorithms.hxx>
 
 #include <cub/cub.cuh>
+#include <thrust/functional.h>
 #include <thrust/transform_reduce.h>
 
 #include <chrono>
@@ -148,6 +149,14 @@ class engine_t {
     const char* trace_env = std::getenv("GACGE_TRAVERSAL_TRACE");
     ts_trace_ = ts_on_ && run_index == (trace_env ? std::atoi(trace_env) : 1);
     ts_run_ = run_index;
+    for (int k = 0; k < 3; k++) ts_steps_[k] = ts_v_[k] = ts_e_[k] = 0;
+    ts_max_e_ = ts_small_ = 0;
+    ts_imb_sum_ = 0;
+    ts_imb_n_ = 0;
+    if constexpr (kTuple) {
+      path_table_.EnableCounters(ts_on_);
+      path_table_.ResetCounters();
+    }
     dev_matching_.Fill(static_cast<index_t>(nnodes_));
     found_ = DFLAG_FALSE;
     size_t searches = 1;
@@ -160,11 +169,20 @@ class engine_t {
     if (ts_on_) {
       size_t steps = 0, fv = 0, fe = 0;
       for (int k = 0; k < 3; k++) { steps += ts_steps_[k]; fv += ts_v_[k]; fe += ts_e_[k]; }
+      unsigned long long walks = 0, walk_steps = 0, paths = 0, flips = 0;
+      if constexpr (kTuple) {
+        walks = path_table_.BaseWalks();
+        walk_steps = path_table_.BaseWalkSteps();
+        paths = path_table_.AugmentingPaths();
+        flips = path_table_.AugmentingPathFlips();
+      }
       std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
-                  "nodes=%zu edges=%zu searches=%zu aug_steps=%zu aug_e=%zu expand_steps=%zu expand_e=%zu "
-                  "blossom_steps=%zu blossom_e=%zu\n",
-                  ts_run_, steps, fv, fe, ts_max_e_, ts_small_, nnodes_, (size_t)G_.get_number_of_edges(), searches,
-                  ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1], ts_steps_[2], ts_e_[2]);
+                  "imbalance=%.3f nodes=%zu edges=%zu searches=%zu aug_steps=%zu aug_e=%zu expand_steps=%zu "
+                  "expand_e=%zu blossom_steps=%zu blossom_e=%zu base_walks=%llu base_walk_steps=%llu "
+                  "aug_paths=%llu aug_path_flips=%llu\n",
+                  ts_run_, steps, fv, fe, ts_max_e_, ts_small_, ts_imb_n_ ? ts_imb_sum_ / ts_imb_n_ : 0.0, nnodes_,
+                  (size_t)G_.get_number_of_edges(), searches, ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1],
+                  ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips);
     }
     std::vector<index_t> mate(nnodes_);
     thrust::copy(dev_matching_.begin(), dev_matching_.end(), mate.begin());
@@ -276,18 +294,23 @@ class engine_t {
   bool ts_on_{false}, ts_trace_{false};
   int ts_run_{0}, ts_phase_{0};
   size_t ts_steps_[3]{0, 0, 0}, ts_v_[3]{0, 0, 0}, ts_e_[3]{0, 0, 0}, ts_max_e_{0}, ts_small_{0};
+  double ts_imb_sum_{0};  // sum over steps of max degree / mean degree of the frontier
+  size_t ts_imb_n_{0};
 
   // The loaded frontier's vertices and the edges the advance will examine (their degrees)
   void TraversalStep() {
     const size_t n = input_frontier_.get_number_of_elements();
-    size_t fe = 0;
+    size_t fe = 0, max_deg = 0;
     if (n > 0) {
       auto g = G_;
       auto first = input_frontier_.begin();
-      fe = thrust::transform_reduce(
-          thrust::device, first, first + n,
-          [g] __device__(vertex_t const& v) -> size_t { return (size_t)g.get_number_of_neighbors(v); }, size_t(0),
-          thrust::plus<size_t>());
+      auto deg = [g] __device__(vertex_t const& v) -> size_t { return (size_t)g.get_number_of_neighbors(v); };
+      fe = thrust::transform_reduce(thrust::device, first, first + n, deg, size_t(0), thrust::plus<size_t>());
+      max_deg = thrust::transform_reduce(thrust::device, first, first + n, deg, size_t(0), thrust::maximum<size_t>());
+    }
+    if (fe > 0) {
+      ts_imb_sum_ += (double)max_deg * (double)n / (double)fe;
+      ts_imb_n_++;
     }
     const int k = ts_phase_;
     ts_steps_[k]++;
@@ -297,8 +320,8 @@ class engine_t {
     ts_small_ += fe < 65536;
     if (ts_trace_) {
       static const char* names[3] = {"augpath", "expand", "blossom"};
-      std::printf("XBStep: run=%d step=%zu phase=%s frontier_v=%zu frontier_e=%zu\n", ts_run_,
-                  ts_steps_[0] + ts_steps_[1] + ts_steps_[2] - 1, names[k], n, fe);
+      std::printf("XBStep: run=%d step=%zu phase=%s frontier_v=%zu frontier_e=%zu max_deg=%zu\n", ts_run_,
+                  ts_steps_[0] + ts_steps_[1] + ts_steps_[2] - 1, names[k], n, fe, max_deg);
     }
   }
 
