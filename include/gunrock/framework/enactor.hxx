@@ -234,6 +234,8 @@ struct enactor_t {
    * examine (the sum of their degrees), for GACGE_TRAVERSAL_STATS.
    */
   void traversal_frontier_work(std::size_t& fv, std::size_t& fe, std::size_t& max_deg) {
+    // the operators run asynchronously on the context's stream: let the step finish first
+    cudaDeviceSynchronize();
     auto f = get_input_frontier();
     auto n = f->get_number_of_elements();
     fv = fe = max_deg = 0;
