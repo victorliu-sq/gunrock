@@ -169,20 +169,22 @@ class engine_t {
     if (ts_on_) {
       size_t steps = 0, fv = 0, fe = 0;
       for (int k = 0; k < 3; k++) { steps += ts_steps_[k]; fv += ts_v_[k]; fe += ts_e_[k]; }
-      unsigned long long walks = 0, walk_steps = 0, paths = 0, flips = 0;
+      unsigned long long walks = 0, walk_steps = 0, paths = 0, flips = 0, direct = 0, max_flips = 0;
       if constexpr (kTuple) {
         walks = path_table_.BaseWalks();
         walk_steps = path_table_.BaseWalkSteps();
         paths = path_table_.AugmentingPaths();
         flips = path_table_.AugmentingPathFlips();
+        direct = path_table_.DirectAugmentingPaths();
+        max_flips = path_table_.MaxAugmentingPathFlips();
       }
       std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
                   "imbalance=%.3f nodes=%zu edges=%zu searches=%zu aug_steps=%zu aug_e=%zu expand_steps=%zu "
                   "expand_e=%zu blossom_steps=%zu blossom_e=%zu base_walks=%llu base_walk_steps=%llu "
-                  "aug_paths=%llu aug_path_flips=%llu\n",
+                  "aug_paths=%llu aug_path_flips=%llu aug_paths_direct=%llu aug_path_max_flips=%llu\n",
                   ts_run_, steps, fv, fe, ts_max_e_, ts_small_, ts_imb_n_ ? ts_imb_sum_ / ts_imb_n_ : 0.0, nnodes_,
                   (size_t)G_.get_number_of_edges(), searches, ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1],
-                  ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips);
+                  ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips, direct, max_flips);
     }
     std::vector<index_t> mate(nnodes_);
     thrust::copy(dev_matching_.begin(), dev_matching_.end(), mate.begin());
