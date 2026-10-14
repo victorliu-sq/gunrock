@@ -13,6 +13,7 @@ struct parameters_t {
   cxxopts::Options options;
   bool validate;
   bool reduce_all_triangles;
+  int num_runs;
 
   /**
    * @brief Construct a new parameters object and parse command line arguments.
@@ -30,7 +31,9 @@ struct parameters_t {
         "r,reduce",
         "Compute a single triangle count for the entire graph (default = "
         "false)",
-        cxxopts::value<bool>()->default_value("false"));
+        cxxopts::value<bool>()->default_value("false"))(
+        "n,num_runs", "Number of runs",
+        cxxopts::value<int>()->default_value("1"));
 
     // Parse command line arguments
     auto result = options.parse(argc, argv);
@@ -42,6 +45,7 @@ struct parameters_t {
     filename = result["market"].as<std::string>();
     validate = result["validate"].as<bool>();
     reduce_all_triangles = result["reduce"].as<bool>();
+    num_runs = result["num_runs"].as<int>();
   }
 };
 
@@ -93,9 +97,16 @@ void test_tc(int num_arguments, char** argument_array) {
   // --
   // GPU Run
 
+  // -n runs, each from zeroed per-vertex counts (tc::run adds into them)
   std::size_t total_triangles = 0;
-  float gpu_elapsed = tc::run(G, params.reduce_all_triangles,
-                              triangles_count.data().get(), &total_triangles);
+  std::vector<float> run_times;
+  for (int i = 0; i < params.num_runs; i++) {
+    thrust::fill(triangles_count.begin(), triangles_count.end(), 0);
+    total_triangles = 0;
+    run_times.push_back(tc::run(G, params.reduce_all_triangles,
+                                triangles_count.data().get(), &total_triangles));
+    std::cout << "TCResult: total=" << total_triangles << std::endl;
+  }
 
   // --
   // Log
@@ -104,7 +115,8 @@ void test_tc(int num_arguments, char** argument_array) {
   if (params.reduce_all_triangles) {
     std::cout << "Total Graph Traingles : " << total_triangles << std::endl;
   }
-  std::cout << "GPU Elapsed Time : " << gpu_elapsed << " (ms)" << std::endl;
+  for (float t : run_times)
+    std::cout << "GPU Elapsed Time : " << t << " (ms)" << std::endl;
 
   // --
   // CPU validation

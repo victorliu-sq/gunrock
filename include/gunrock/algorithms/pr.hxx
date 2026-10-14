@@ -20,8 +20,10 @@ template <typename weight_t>
 struct param_t {
   weight_t alpha;
   weight_t tol;
+  int max_iters;  // > 0: stop after this many iterations (GACGE: 20, tol 0)
 
-  param_t(weight_t _alpha, weight_t _tol) : alpha(_alpha), tol(_tol) {}
+  param_t(weight_t _alpha, weight_t _tol, int _max_iters = 0)
+      : alpha(_alpha), tol(_tol), max_iters(_max_iters) {}
 };
 
 template <typename weight_t>
@@ -172,6 +174,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       return false;
 
     auto P = this->get_problem();
+    // a fixed iteration count (checked before every iteration: exactly max_iters)
+    if (P->param.max_iters > 0 && this->iteration >= P->param.max_iters)
+      return true;
     auto G = P->get_graph();
     auto tol = P->param.tol;
 
@@ -201,7 +206,9 @@ float run(graph_t& G,
           typename graph_t::weight_type* p,  // Output
           std::shared_ptr<gcuda::multi_context_t> context =
               std::shared_ptr<gcuda::multi_context_t>(
-                  new gcuda::multi_context_t(0))  // Context
+                  new gcuda::multi_context_t(0)),  // Context
+          int max_iters = 0,         // > 0: exactly this many iterations
+          int* iterations = nullptr  // Output: the iterations run
 ) {
   // <user-defined>
   using vertex_t = typename graph_t::vertex_type;
@@ -210,7 +217,7 @@ float run(graph_t& G,
   using param_type = param_t<weight_t>;
   using result_type = result_t<weight_t>;
 
-  param_type param(alpha, tol);
+  param_type param(alpha, tol, max_iters);
   result_type result(p);
   // </user-defined>
 
@@ -226,7 +233,10 @@ float run(graph_t& G,
   props.self_manage_frontiers = true;
 
   enactor_type enactor(&problem, context, props);
-  return enactor.enact();
+  float ms = enactor.enact();
+  if (iterations)
+    *iterations = enactor.iteration;
+  return ms;
   // </boiler-plate>
 }
 

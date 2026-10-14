@@ -1,6 +1,9 @@
 #include <gunrock/algorithms/pr.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <thrust/reduce.h>
+#include <cstdio>
+#include <cstdlib>
 
 using namespace gunrock;
 using namespace memory;
@@ -45,6 +48,13 @@ void test_pr(int num_arguments, char** argument_array) {
 
   weight_t alpha = 0.85;
   weight_t tol = 1e-6;
+  // GACGE_PR_ITERS=k: exactly k iterations, no convergence test (as Ligra's
+  // PageRank with -maxiters k -epsilon 0)
+  int max_iters = 0;
+  if (const char* it = std::getenv("GACGE_PR_ITERS")) {
+    max_iters = std::atoi(it);
+    tol = 0;
+  }
 
   size_t n_vertices = G.get_number_of_vertices();
   size_t n_edges = G.get_number_of_edges();
@@ -64,7 +74,14 @@ void test_pr(int num_arguments, char** argument_array) {
   for (int i = 0; i < params.num_runs; i++) {
     benchmark::INIT_BENCH();
 
-    run_times.push_back(gunrock::pr::run(G, alpha, tol, p.data().get()));
+    int iterations = 0;
+    run_times.push_back(gunrock::pr::run(
+        G, alpha, tol, p.data().get(),
+        std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0)),
+        max_iters, &iterations));
+    weight_t rank0 = p[0];
+    double rank_sum = thrust::reduce(p.begin(), p.end(), 0.0);
+    std::printf("PRResult: iterations=%d rank_sum=%.9f rank0=%.9e\n", iterations, rank_sum, (double)rank0);
 
     benchmark::host_benchmark_t metrics = benchmark::EXTRACT();
     benchmark_metrics[i] = metrics;
@@ -87,8 +104,8 @@ void test_pr(int num_arguments, char** argument_array) {
 
   print::head(p, 40, "GPU rank");
 
-  std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]
-            << " (ms)" << std::endl;
+  for (size_t i = 0; i < run_times.size(); i++)
+    std::cout << "GPU Elapsed Time : " << run_times[i] << " (ms)" << std::endl;
 }
 
 int main(int argc, char** argv) {
