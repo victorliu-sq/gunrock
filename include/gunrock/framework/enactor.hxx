@@ -192,6 +192,20 @@ struct enactor_t {
               ? g.get_number_of_edges()
               : g.get_number_of_vertices();
 
+      // GACGE: when |E| elements per buffer (times the resizing factor) do not
+      // fit beside the graph (Webbase on a 24 GB L4: 2 x 10.3 GB next to a
+      // 7.3 GB graph), reserve |V| and let advance grow a buffer when a step
+      // needs more. Graphs that fit keep the up-front reservation.
+      std::size_t free_bytes = 0, total_bytes = 0;
+      if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess) {
+        const double need = double(initial_size) *
+                            properties.frontier_sizing_factor *
+                            sizeof(vertex_t) * frontiers.size();
+        const double margin = double(1ull << 30);
+        if (need + margin > double(free_bytes))
+          initial_size = g.get_number_of_vertices();
+      }
+
       for (auto& buffer : frontiers) {
         buffer.set_resizing_factor(properties.frontier_sizing_factor);
         buffer.reserve((std::size_t)(initial_size));
