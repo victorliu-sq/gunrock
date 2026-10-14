@@ -12,8 +12,40 @@
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/util/timer.hxx>
 
+#include <cstdlib>
+#include <string>
+
 namespace gunrock {
 namespace tc {
+
+// GACGE: the advance's load balancing. merge_path (default) spreads the edges
+// evenly over the GPU's threads, so a high-degree vertex's merges no longer
+// run in one 256-thread block (block_mapped, Gunrock's choice: Arabic's
+// 575K-degree vertices kept one SM busy for minutes); it matches Ligra's
+// dense_parallel on the CPU. GACGE_TC_LB=block restores block_mapped.
+inline bool tc_block_mapped() {
+  static const bool block = [] {
+    const char* e = std::getenv("GACGE_TC_LB");
+    return e != nullptr && std::string(e) == "block";
+  }();
+  return block;
+}
+
+#define GACGE_TC_ADVANCE(G, E, op, context)                                  \
+  do {                                                                       \
+    if (tc_block_mapped())                                                   \
+      operators::advance::execute<operators::load_balance_t::block_mapped,   \
+                                  operators::advance_direction_t::forward,   \
+                                  operators::advance_io_type_t::graph,       \
+                                  operators::advance_io_type_t::none>(       \
+          G, E, op, context);                                                \
+    else                                                                     \
+      operators::advance::execute<operators::load_balance_t::merge_path,     \
+                                  operators::advance_direction_t::forward,   \
+                                  operators::advance_io_type_t::graph,       \
+                                  operators::advance_io_type_t::none>(       \
+          G, E, op, context);                                                \
+  } while (0)
 
 template <typename vertex_t>
 struct param_t {
@@ -108,11 +140,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
         return false;
       };
-      operators::advance::execute<operators::load_balance_t::block_mapped,
-                                  operators::advance_direction_t::forward,
-                                  operators::advance_io_type_t::graph,
-                                  operators::advance_io_type_t::none>(
-          G, E, oriented, context);
+      GACGE_TC_ADVANCE(G, E, oriented, context);
       return;
     }
 
@@ -139,11 +167,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
 
     // Execute advance operator on the provided lambda
-    operators::advance::execute<operators::load_balance_t::block_mapped,
-                                operators::advance_direction_t::forward,
-                                operators::advance_io_type_t::graph,
-                                operators::advance_io_type_t::none>(
-        G, E, intersect, context);
+    GACGE_TC_ADVANCE(G, E, intersect, context);
   }
 
   virtual bool is_converged(gcuda::multi_context_t& context) {
