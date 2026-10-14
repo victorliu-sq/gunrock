@@ -135,19 +135,5 @@ void test_bfs(int num_arguments, char** argument_array) {
 }
 
 int main(int argc, char** argv) {
-  // GACGE_MEMPOOL_KEEP=1: the device's default memory pool keeps freed memory
-  // (release threshold = max) instead of returning it at every synchronize, so
-  // the per-step cudaMallocAsync of thrust/cub temporaries and frontiers does
-  // not map fresh memory every time (nsys, Amazon: 96 calls, 185 us each, 71%
-  // of a 24.8 ms BFS whose kernels take 0.64 ms).
-  if (const char* keep = std::getenv("GACGE_MEMPOOL_KEEP")) {
-    if (std::atoi(keep)) {
-      cudaMemPool_t pool;
-      cudaDeviceGetDefaultMemPool(&pool, 0);
-      uint64_t threshold = UINT64_MAX;
-      cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
-      std::cout << "GACGEMempool: keep=1" << std::endl;
-    }
-  }
   test_bfs(argc, argv);
 }

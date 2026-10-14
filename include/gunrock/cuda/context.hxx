@@ -12,6 +12,8 @@
 
 #include <moderngpu/context.hxx>
 #include <thrust/execution_policy.h>
+#include <cstdint>
+#include <cstdlib>
 #include <iostream>
 
 namespace gunrock {
@@ -19,6 +21,31 @@ namespace gcuda {
 
 template <int dummy_arg>
 __global__ void dummy_k() {}
+
+/**
+ * @brief GACGE: the device's default memory pool keeps the memory it gets back
+ * (release threshold = max). Gunrock allocates per step with cudaMallocAsync
+ * (thrust / cub temporaries, frontiers); with the default threshold of 0 every
+ * synchronize returns the pool's free memory to the driver and the next
+ * allocation maps it again (nsys, BFS on Amazon: 96 cudaMallocAsync of 185 us
+ * each, 71% of a 24.8 ms run whose kernels take 0.64 ms; 4.5x faster BFS on
+ * the ten graphs with the pool kept). Once per device; GACGE_MEMPOOL_KEEP=0
+ * keeps CUDA's default.
+ */
+inline void keep_default_mempool(int device) {
+  static bool done[64] = {};
+  if (device < 0 || device >= 64 || done[device])
+    return;
+  done[device] = true;
+  const char* env = std::getenv("GACGE_MEMPOOL_KEEP");
+  if (env && std::atoi(env) == 0)
+    return;
+  cudaMemPool_t pool;
+  if (cudaDeviceGetDefaultMemPool(&pool, device) != cudaSuccess)
+    return;
+  uint64_t threshold = UINT64_MAX;
+  cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+}
 
 struct context_t {
   context_t() = default;
@@ -52,6 +79,7 @@ class standard_context_t : public context_t {
     _ptx_version = gcuda::make_compute_capability(attr.ptxVersion);
 
     cudaSetDevice(_ordinal);
+    keep_default_mempool(_ordinal);
     cudaStreamCreateWithFlags(&_stream, cudaStreamNonBlocking);
     cudaEventCreateWithFlags(&_event, cudaEventDisableTiming);
     cudaGetDeviceProperties(&_props, _ordinal);
