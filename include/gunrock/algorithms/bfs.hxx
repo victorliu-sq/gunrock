@@ -17,7 +17,13 @@ namespace bfs {
 template <typename vertex_t>
 struct param_t {
   vertex_t single_source;
-  param_t(vertex_t _single_source) : single_source(_single_source) {}
+  // Direction-optimized (GACGE, as Ligra's edgeMap on BFS and the Gunrock
+  // paper's push-pull BFS): a step whose frontier vertices + their edges exceed
+  // 5% of the edges pulls (every unvisited vertex scans its neighbors until one
+  // is in the current level; the graph is symmetric), any other step pushes.
+  bool direction_optimized;
+  param_t(vertex_t _single_source, bool _direction_optimized = false)
+      : single_source(_single_source), direction_optimized(_direction_optimized) {}
 };
 
 template <typename vertex_t>
@@ -76,7 +82,60 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     f->push_back(P->param.single_source);
   }
 
+  // Direction-optimized BFS: decides the step's direction by Ligra's rule and,
+  // for a pull step, runs it and makes the next frontier; false: push.
+  bool pull_step(gcuda::multi_context_t& context) {
+    auto P = this->get_problem();
+    auto G = P->get_graph();
+    auto distances = P->result.distances;
+    auto policy = this->context->get_context(0)->execution_policy();
+    auto* in = this->get_input_frontier();
+    const std::size_t len = in->get_number_of_elements();
+    const vertex_t* f = in->data();
+    // the frontier's vertices and their edges (push frontiers carry invalids)
+    const std::size_t n_f = thrust::count_if(policy, f, f + len, [] __host__ __device__(vertex_t v) {
+      return gunrock::util::limits::is_valid(v);
+    });
+    const std::size_t m_f = thrust::transform_reduce(
+        policy, f, f + len,
+        [G] __host__ __device__(vertex_t v) -> std::size_t {
+          return gunrock::util::limits::is_valid(v) ? (std::size_t)G.get_number_of_neighbors(v) : 0;
+        },
+        std::size_t{0}, thrust::plus<std::size_t>());
+    const std::size_t m = G.get_number_of_edges();
+    if (n_f + m_f <= m / 20)
+      return false;
+    const vertex_t level = this->iteration;
+    const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
+    auto pull = [G, distances, level, unvisited] __host__ __device__(vertex_t const& v) {
+      if (distances[v] != unvisited)
+        return;
+      auto e = G.get_starting_edge(v), ee = G.get_starting_edge(v + 1);
+      for (; e < ee; ++e)
+        if (distances[G.get_destination_vertex(e)] == level) {
+          distances[v] = level + 1;  // only v's thread writes v: no atomic
+          break;
+        }
+    };
+    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, pull, context);
+    // the next frontier: the vertices this step reached
+    const vertex_t n = G.get_number_of_vertices();
+    auto* out = this->get_output_frontier();
+    out->reserve(n);
+    vertex_t* o = out->data();
+    auto end = thrust::copy_if(policy, thrust::counting_iterator<vertex_t>(0),
+                               thrust::counting_iterator<vertex_t>(n), o,
+                               [distances, level] __host__ __device__(vertex_t v) {
+                                 return distances[v] == level + 1;
+                               });
+    out->set_number_of_elements(end - o);
+    this->swap_frontier_buffers();
+    return true;
+  }
+
   void loop(gcuda::multi_context_t& context) override {
+    if (this->get_problem()->param.direction_optimized && pull_step(context))
+      return;
     // Data slice
     auto E = this->get_enactor();
     auto P = this->get_problem();
@@ -155,13 +214,14 @@ float run(graph_t& G,
           typename graph_t::vertex_type* predecessors,   // Output
           std::shared_ptr<gcuda::multi_context_t> context =
               std::shared_ptr<gcuda::multi_context_t>(
-                  new gcuda::multi_context_t(0))  // Context
+                  new gcuda::multi_context_t(0)),  // Context
+          bool direction_optimized = false  // push-pull by Ligra's 5% rule
 ) {
   using vertex_t = typename graph_t::vertex_type;
   using param_type = param_t<vertex_t>;
   using result_type = result_t<vertex_t>;
 
-  param_type param(single_source);
+  param_type param(single_source, direction_optimized);
   result_type result(distances, predecessors);
 
   using problem_type = problem_t<graph_t, param_type, result_type>;

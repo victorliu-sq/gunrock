@@ -1,4 +1,5 @@
 #include <gunrock/algorithms/bfs.hxx>
+#include <cstdlib>
 #include <gunrock/algorithms/dawn.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
@@ -20,8 +21,13 @@ void test_bfs(int num_arguments, char** argument_array) {
   using csr_t =
       format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
 
+  // GACGE_BFS: do (default; direction-optimized, as Ligra's BFS and the
+  // Gunrock paper's), push (Gunrock's push-only BFS) or dawn (the DAWN BFS,
+  // push only, the default before 2026-10-14)
+  const char* gacge_bfs = std::getenv("GACGE_BFS");
+  const std::string bfs_kind = gacge_bfs ? gacge_bfs : "do";
   std::string DEFAULT_BFS_ALGORITHMS =
-      "DAWN";  // Using 'Breadth First Search' here will call the original BFS
+      bfs_kind == "dawn" ? "DAWN" : "Breadth First Search";
   // --
   // IO
 
@@ -74,9 +80,10 @@ void test_bfs(int num_arguments, char** argument_array) {
                                                  distances.data().get(),
                                                  predecessors.data().get()));
     else
-      run_times.push_back(gunrock::bfs::run(G, source_vect[i],
-                                            distances.data().get(),
-                                            predecessors.data().get()));
+      run_times.push_back(gunrock::bfs::run(
+          G, source_vect[i], distances.data().get(), predecessors.data().get(),
+          std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0)),
+          bfs_kind == "do"));
 
     benchmark::host_benchmark_t metrics = benchmark::EXTRACT();
     benchmark_metrics[i] = metrics;
@@ -100,6 +107,7 @@ void test_bfs(int num_arguments, char** argument_array) {
 
   // Print info for all runs so experiment scripts can compute confidence intervals.
   std::cout << "Source : " << source_vect.back() << "\n";
+  std::cout << "BFSConfig: kind=" << bfs_kind << std::endl;
   print::head(distances, 40, "GPU distances");
   for (size_t i = 0; i < run_times.size(); i++) {
     std::cout << "GPU Elapsed Time : " << run_times[i] << " (ms)"
