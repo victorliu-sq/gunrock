@@ -3,6 +3,7 @@
 #include <gunrock/algorithms/dawn.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gacge_bin.hxx>
 #include <gunrock/framework/benchmark.hxx>
 
 #include "bfs_cpu.hxx"  // Reference implementation
@@ -34,21 +35,26 @@ void test_bfs(int num_arguments, char** argument_array) {
   gunrock::io::cli::parameters_t params(num_arguments, argument_array,
                                         DEFAULT_BFS_ALGORITHMS);
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(params.filename);
-
+  // GACGE binary CSR (<name>.bin, gunrock/io/gacge_bin.hxx): one parallel read
+  // of the canonical graph Ligra reads too; .mtx / .csr as before.
   csr_t csr;
-
-  if (params.binary) {
-    csr.read_binary(params.filename);
+  graph::graph_properties_t properties;
+  if (params.gacge_binary) {
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::none);
   } else {
-    csr.from_coo(coo);
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(params.filename);
+    properties = props;
+    if (params.binary) {
+      csr.read_binary(params.filename);
+    } else {
+      csr.from_coo(coo);
+    }
   }
 
-  // --
-  // Build graph
-
   auto G = graph::build<memory_space_t::device>(properties, csr);
+  if (params.gacge_binary)  // no edge weights on the device: they alias the column indices
+    G.alias_values(reinterpret_cast<weight_t*>(thrust::raw_pointer_cast(csr.column_indices.data())));
 
   // --
   // Params and memory allocation

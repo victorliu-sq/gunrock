@@ -2,6 +2,7 @@
 
 #include <gunrock/algorithms/tc.hxx>
 #include "tc_cpu.hxx"
+#include <gunrock/io/gacge_bin.hxx>
 
 #include <cxxopts.hpp>
 
@@ -74,7 +75,11 @@ void test_tc(int num_arguments, char** argument_array) {
   gunrock::graph::graph_properties_t properties =
       gunrock::graph::graph_properties_t();
 
-  if (util::is_market(params.filename)) {
+  if (gacge_bin::is_bin(params.filename.c_str())) {
+    // GACGE binary CSR (gunrock/io/gacge_bin.hxx): sorted lists, the canonical
+    // graph Ligra reads too; no edge weights (they alias the column indices)
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::none);
+  } else if (util::is_market(params.filename)) {
     io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
     auto [properties, coo] = mm.load(params.filename);
     if (!properties.symmetric) {
@@ -93,6 +98,8 @@ void test_tc(int num_arguments, char** argument_array) {
   // Build graph
 
   auto G = graph::build<memory_space_t::device>(properties, csr);
+  if (gacge_bin::is_bin(params.filename.c_str()))
+    G.alias_values(reinterpret_cast<weight_t*>(thrust::raw_pointer_cast(csr.column_indices.data())));
 
   // --
   // Params and memory allocation

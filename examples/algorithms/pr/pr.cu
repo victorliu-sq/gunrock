@@ -1,6 +1,7 @@
 #include <gunrock/algorithms/pr.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gacge_bin.hxx>
 #include <thrust/reduce.h>
 #include <cstdio>
 #include <cstdlib>
@@ -25,19 +26,22 @@ void test_pr(int num_arguments, char** argument_array) {
   gunrock::io::cli::parameters_t params(num_arguments, argument_array,
                                         "Page Rank");
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(params.filename);
-
+  // GACGE binary CSR (<name>.bin, gunrock/io/gacge_bin.hxx): one parallel read
+  // of the canonical graph Ligra reads too; .mtx / .csr as before.
   csr_t csr;
-
-  if (params.binary) {
-    csr.read_binary(params.filename);
+  graph::graph_properties_t properties;
+  if (params.gacge_binary) {
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::ones);
   } else {
-    csr.from_coo(coo);
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(params.filename);
+    properties = props;
+    if (params.binary) {
+      csr.read_binary(params.filename);
+    } else {
+      csr.from_coo(coo);
+    }
   }
-
-  // --
-  // Build graph
 
   auto G = graph::build<memory_space_t::device>(properties, csr);
 

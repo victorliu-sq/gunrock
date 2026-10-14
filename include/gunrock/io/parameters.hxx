@@ -24,6 +24,7 @@ struct parameters_t {
   bool export_metrics = false;
   bool validate = false;
   bool binary = false;
+  bool gacge_binary = false;  // <name>.bin: GACGE binary CSR
 
   /**
    * @brief Construct a new parameters object and parse command line arguments.
@@ -80,6 +81,8 @@ struct parameters_t {
       filename = result["market"].as<std::string>();
       if (util::is_binary_csr(filename)) {
         binary = true;
+      } else if (filename.size() > 4 && filename.substr(filename.size() - 4) == ".bin") {
+        gacge_binary = true;  // GACGE binary CSR (gunrock/io/gacge_bin.hxx); the driver reads it
       } else if (!util::is_market(filename)) {
         std::cout << options.help({""}) << std::endl;
         std::exit(0);

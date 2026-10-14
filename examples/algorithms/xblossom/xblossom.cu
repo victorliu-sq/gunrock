@@ -24,6 +24,7 @@
 //   XBCounters: index blossoms steps                    per timed round, with -c 1
 //             (blossoms: closing edges whose base was identified)
 //   XBResult: status matching_size valid rounds mean_runtime_s
+#include <gunrock/io/gacge_bin.hxx>
 #include <gunrock/algorithms/xblossom.hxx>
 
 #include <chrono>
@@ -162,7 +163,10 @@ int main(int argc, char** argv) {
   using host_csr_t = format::csr_t<memory_space_t::host, vertex_t, edge_t, weight_t>;
   graph::graph_properties_t properties;
   host_csr_t hcsr;
-  {
+  if (gacge_bin::is_bin(o.graph.c_str())) {
+    // GACGE binary CSR (gunrock/io/gacge_bin.hxx): the canonical graph XB-Ligra reads too
+    gacge_bin::load_host_csr(o.graph, hcsr, gacge_bin::values_t::none);
+  } else {
     io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
     auto [props, coo] = mm.load(o.graph);
     properties = props;
