@@ -14,6 +14,7 @@ struct parameters_t {
   bool validate;
   bool reduce_all_triangles;
   int num_runs;
+  bool all_edges;
 
   /**
    * @brief Construct a new parameters object and parse command line arguments.
@@ -33,7 +34,11 @@ struct parameters_t {
         "false)",
         cxxopts::value<bool>()->default_value("false"))(
         "n,num_runs", "Number of runs",
-        cxxopts::value<int>()->default_value("1"));
+        cxxopts::value<int>()->default_value("1"))(
+        "all-edges",
+        "Gunrock's own counting (each triangle at its three edges, an atomic "
+        "per triangle) instead of the oriented one (as Ligra's Triangle)",
+        cxxopts::value<bool>()->default_value("false"));
 
     // Parse command line arguments
     auto result = options.parse(argc, argv);
@@ -46,6 +51,7 @@ struct parameters_t {
     validate = result["validate"].as<bool>();
     reduce_all_triangles = result["reduce"].as<bool>();
     num_runs = result["num_runs"].as<int>();
+    all_edges = result["all-edges"].as<bool>();
   }
 };
 
@@ -103,9 +109,13 @@ void test_tc(int num_arguments, char** argument_array) {
   for (int i = 0; i < params.num_runs; i++) {
     thrust::fill(triangles_count.begin(), triangles_count.end(), 0);
     total_triangles = 0;
-    run_times.push_back(tc::run(G, params.reduce_all_triangles,
-                                triangles_count.data().get(), &total_triangles));
-    std::cout << "TCResult: total=" << total_triangles << std::endl;
+    run_times.push_back(tc::run(
+        G, params.reduce_all_triangles, triangles_count.data().get(),
+        &total_triangles,
+        std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0)),
+        !params.all_edges));
+    std::cout << "TCResult: total=" << total_triangles
+              << " oriented=" << !params.all_edges << std::endl;
   }
 
   // --

@@ -18,8 +18,15 @@ namespace tc {
 template <typename vertex_t>
 struct param_t {
   bool reduce_all_triangles;
-  param_t(bool _reduce_all_triangles)
-      : reduce_all_triangles(_reduce_all_triangles) {}
+  // oriented (GACGE, as Ligra's Triangle): every edge (s, d) with d < s merges
+  // the sorted neighbor lists of s and d up to d and adds the count to s once,
+  // so each triangle w < d < s is found once, at its edge (s, d), without an
+  // atomic per triangle. Otherwise (Gunrock's own): every edge (s, d) with
+  // d > s intersects the whole lists and adds 1 to each common neighbor's
+  // count, so each triangle is found at all three of its edges.
+  bool oriented;
+  param_t(bool _reduce_all_triangles, bool _oriented = true)
+      : reduce_all_triangles(_reduce_all_triangles), oriented(_oriented) {}
 };
 
 template <typename vertex_t>
@@ -71,6 +78,43 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto G = P->get_graph();
 
     auto vertex_triangles_count = P->result.vertex_triangles_count;
+
+    if (P->param.oriented) {
+      auto oriented = [G, vertex_triangles_count] __host__ __device__(
+                          vertex_t const& source, vertex_t const& neighbor,
+                          edge_t const& edge, weight_t const& weight) -> bool {
+        if (neighbor < source) {
+          // |N(source) ∩ N(neighbor) ∩ [0, neighbor)| by a merge of the two
+          // sorted lists (Ligra's countCommon)
+          edge_t i = G.get_starting_edge(source), ie = G.get_starting_edge(source + 1);
+          edge_t j = G.get_starting_edge(neighbor), je = G.get_starting_edge(neighbor + 1);
+          vertex_t count = 0;
+          while (i < ie && j < je) {
+            vertex_t a = G.get_destination_vertex(i), b = G.get_destination_vertex(j);
+            if (a >= neighbor || b >= neighbor)
+              break;
+            if (a < b) {
+              i++;
+            } else if (b < a) {
+              j++;
+            } else {
+              count++;
+              i++;
+              j++;
+            }
+          }
+          if (count)
+            math::atomic::add(&(vertex_triangles_count[source]), count);
+        }
+        return false;
+      };
+      operators::advance::execute<operators::load_balance_t::block_mapped,
+                                  operators::advance_direction_t::forward,
+                                  operators::advance_io_type_t::graph,
+                                  operators::advance_io_type_t::none>(
+          G, E, oriented, context);
+      return;
+    }
 
     auto intersect = [G, vertex_triangles_count] __host__ __device__(
                          vertex_t const& source,    // ... source
@@ -135,7 +179,8 @@ float run(graph_t& G,
           std::size_t* total_triangles_count,                     // Output
           std::shared_ptr<gcuda::multi_context_t> context =
               std::shared_ptr<gcuda::multi_context_t>(
-                  new gcuda::multi_context_t(0))  // Context
+                  new gcuda::multi_context_t(0)),  // Context
+          bool oriented = true  // false: Gunrock's own (each triangle 3 times)
 ) {
   // <user-defined>
   using vertex_t = typename graph_t::vertex_type;
@@ -144,7 +189,7 @@ float run(graph_t& G,
   using param_type = param_t<vertex_t>;
   using result_type = result_t<vertex_t>;
 
-  param_type param(reduce_all_triangles);
+  param_type param(reduce_all_triangles, oriented);
   result_type result(vertex_triangles_count, total_triangles_count);
   // </user-defined>
 
