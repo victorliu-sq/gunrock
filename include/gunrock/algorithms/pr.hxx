@@ -47,6 +47,27 @@ inline bool pr_nr() {
   return v;
 }
 
+// GACGE_PR=split: the same pull with Gunrock's operators only: parallel_for
+// over the vertices sums a vertex's neighbors in one thread when its degree is
+// at most GACGE_PR_HEAVY (default 4096); the heavier vertices form a frontier
+// (built once, before the timed loop) that a block_mapped advance spreads over
+// the threads of a block, each edge adding its neighbor's contribution to the
+// vertex's rank with atomicAdd.
+inline bool pr_split() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_PR");
+    return e != nullptr && std::string(e) == "split";
+  }();
+  return v;
+}
+inline long long pr_heavy() {
+  static const long long v = [] {
+    const char* e = std::getenv("GACGE_PR_HEAVY");
+    return e ? std::atoll(e) : 4096LL;
+  }();
+  return v;
+}
+
 inline bool pr_pull() {
   static const bool pull = [] {
     const char* e = std::getenv("GACGE_PR");
@@ -177,6 +198,24 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   using vertex_t = typename problem_t::vertex_t;
   using edge_t = typename problem_t::edge_t;
   using weight_t = typename problem_t::weight_t;
+  using frontier_t = typename enactor_t<problem_t>::frontier_t;
+
+  // GACGE_PR=split: the vertices of degree over GACGE_PR_HEAVY, once
+  void prepare_frontier(frontier_t* f, gcuda::multi_context_t& context) override {
+    if (!pr_split())
+      return;
+    auto G = this->get_problem()->get_graph();
+    const vertex_t n = G.get_number_of_vertices();
+    const long long heavy = pr_heavy();
+    f->reserve(n);
+    vertex_t* out = f->data();
+    auto end = thrust::copy_if(thrust::device, thrust::counting_iterator<vertex_t>(0),
+                               thrust::counting_iterator<vertex_t>(n), out,
+                               [G, heavy] __host__ __device__(vertex_t v) {
+                                 return (long long)G.get_number_of_neighbors(v) > heavy;
+                               });
+    f->set_number_of_elements(end - out);
+  }
 
   void loop(gcuda::multi_context_t& context) override {
     // Data slice
@@ -196,6 +235,35 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // contrib (in plast) = alpha * p / deg, then p = (1 - alpha) / n + sum
       thrust::transform(policy, p, p + n_vertices, iweights, plast,
                         thrust::multiplies<weight_t>());
+      if (pr_split()) {
+        const weight_t base = weight_t((1 - alpha) / n_vertices);
+        const long long heavy = pr_heavy();
+        auto light = [G, plast, p, base, heavy] __device__(vertex_t const& v) {
+          const auto begin = G.get_starting_edge(v), end = G.get_starting_edge(v + 1);
+          if ((long long)(end - begin) > heavy) {
+            p[v] = base;  // the advance adds its edges
+            return;
+          }
+          weight_t sum = 0;
+          for (auto e = begin; e < end; ++e)
+            sum += plast[G.get_destination_vertex(e)];
+          p[v] = base + sum;
+        };
+        operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, light, context);
+        auto heavy_edge = [p, plast] __host__ __device__(vertex_t const& v, vertex_t const& u,
+                                                          edge_t const& e, weight_t const& w) -> bool {
+          math::atomic::add(p + v, plast[u]);
+          return false;
+        };
+        if (E->get_input_frontier()->get_number_of_elements() > 0)  // no vertex over the threshold: none
+          operators::advance::execute<operators::load_balance_t::block_mapped,
+                                      operators::advance_direction_t::forward,
+                                      operators::advance_io_type_t::vertices,
+                                      operators::advance_io_type_t::none>(
+              G, heavy_edge, E->get_input_frontier(), E->get_output_frontier(), E->scanned_work_domain,
+              context);
+        return;
+      }
       if (pr_nr()) {
         auto edge_contrib = [G, plast] __host__ __device__(edge_t edge) -> weight_t {
           return plast[G.get_destination_vertex(edge)];
