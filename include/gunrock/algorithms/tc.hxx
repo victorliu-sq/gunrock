@@ -12,7 +12,6 @@
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/util/timer.hxx>
 
-#include <cub/block/block_scan.cuh>
 #include <thrust/binary_search.h>
 
 #include <cstdlib>
@@ -37,18 +36,15 @@ inline bool tc_block_mapped() {
   return block;
 }
 
-// GACGE_TC=block: the oriented count block-mapped as Gunrock's block_mapped
-// advance (TPB consecutive vertices per block, their edges spread over the
-// threads by a block-wide degree scan and a shared-memory binary search); an
-// edge whose end points' degrees sum to at most GACGE_TC_HEAVY (default 1024)
-// is merged by its thread, a heavier one is queued and intersected by a whole
-// warp (the lanes take the shorter list's entries below d and binary-search
-// them in the longer one), so a hub's long intersections do not stall a warp
-// of short ones.
-inline bool tc_block() {
+// GACGE_TC=split: one thread per edge as by default, but an edge whose end
+// points' degrees sum to more than GACGE_TC_HEAVY (default 1024) is queued and
+// intersected by a whole warp (the lanes take the shorter list's entries below
+// d and binary-search them in the longer one), so a hub's long intersections
+// do not stall the 31 other lanes of a warp of short ones.
+inline bool tc_split() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_TC");
-    return e != nullptr && std::string(e) == "block";
+    return e != nullptr && std::string(e) == "split";
   }();
   return v;
 }
@@ -75,55 +71,6 @@ __device__ __forceinline__ vertex_t tc_merge(const graph_t& G, vertex_t s, verte
     else { count++; i++; j++; }
   }
   return count;
-}
-
-template <int TPB, typename graph_t, typename vertex_t>
-__global__ void __launch_bounds__(TPB)
-    tc_block_kernel(graph_t G, vertex_t* counts, typename graph_t::edge_type* heavy,
-                    unsigned long long* heavy_n, long long heavy_deg) {
-  using edge_t = typename graph_t::edge_type;
-  using scan_t = cub::BlockScan<edge_t, TPB>;
-  __shared__ typename scan_t::TempStorage scan;
-  __shared__ edge_t offset[TPB];
-  __shared__ edge_t start[TPB];
-  __shared__ edge_t deg[TPB];
-  const int t = threadIdx.x;
-  const vertex_t n = G.get_number_of_vertices();
-  const vertex_t first = static_cast<vertex_t>(blockIdx.x) * TPB, v = first + t;
-  edge_t degree = 0;
-  if (v < n) {
-    start[t] = G.get_starting_edge(v);
-    degree = G.get_number_of_neighbors(v);
-  }
-  deg[t] = degree;
-  edge_t mine, total;
-  scan_t(scan).ExclusiveSum(degree, mine, total);
-  offset[t] = mine;
-  __syncthreads();
-  int cur = -1;
-  vertex_t acc = 0;
-  for (edge_t i = t; i < total; i += TPB) {
-    int lo = 0, hi = TPB - 1;  // the vertex whose edge range holds i
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (offset[mid] <= i) lo = mid; else hi = mid - 1;
-    }
-    const vertex_t s = first + lo;
-    const edge_t e = start[lo] + (i - offset[lo]);
-    const vertex_t d = G.get_destination_vertex(e);
-    if (d >= s) continue;
-    if ((long long)deg[lo] + (long long)G.get_number_of_neighbors(d) > heavy_deg) {
-      heavy[atomicAdd(heavy_n, 1ULL)] = e;  // a warp intersects it
-      continue;
-    }
-    if (lo != cur) {
-      if (cur >= 0 && acc) math::atomic::add(&counts[first + cur], acc);
-      cur = lo;
-      acc = 0;
-    }
-    acc += tc_merge(G, s, d);
-  }
-  if (cur >= 0 && acc) math::atomic::add(&counts[first + cur], acc);
 }
 
 template <typename graph_t, typename vertex_t>
@@ -195,12 +142,12 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using vertex_t = typename graph_t::vertex_type;
   using edge_t = typename graph_t::edge_type;
 
-  // GACGE_TC=block: the queue of heavy edges (one slot per edge) and its length
+  // GACGE_TC=split: the queue of heavy edges (one slot per edge) and its length
   thrust::device_vector<edge_t> heavy;
   thrust::device_vector<unsigned long long> heavy_n;
 
   void init() override {
-    if (tc_block()) {
+    if (tc_split()) {
       heavy.resize(this->get_graph().get_number_of_edges());
       heavy_n.resize(1);
     }
@@ -258,15 +205,25 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
         return false;
       };
-      if (tc_block()) {
-        constexpr int TPB = 256;
+      if (tc_split()) {
         auto stream = this->context->get_context(0)->stream();
-        const vertex_t n = G.get_number_of_vertices();
         unsigned long long* heavy_n = P->heavy_n.data().get();
+        edge_t* heavy = P->heavy.data().get();
+        const long long heavy_deg = tc_heavy();
         cudaMemsetAsync(heavy_n, 0, sizeof(unsigned long long), stream);
-        tc_block_kernel<TPB><<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
-            G, vertex_triangles_count, P->heavy.data().get(), heavy_n, (long long)tc_heavy());
-        error::throw_if_exception(cudaGetLastError(), "tc block kernel");
+        auto light_edge = [G, vertex_triangles_count, heavy, heavy_n, heavy_deg] __device__(edge_t const& e) {
+          const vertex_t s = G.get_source_vertex(e), d = G.get_destination_vertex(e);
+          if (d >= s)
+            return;
+          if ((long long)G.get_number_of_neighbors(s) + (long long)G.get_number_of_neighbors(d) > heavy_deg) {
+            heavy[atomicAdd(heavy_n, 1ULL)] = e;  // a warp intersects it
+            return;
+          }
+          const vertex_t c = tc_merge(G, s, d);
+          if (c)
+            math::atomic::add(&vertex_triangles_count[s], c);
+        };
+        operators::parallel_for::execute<operators::parallel_for_each_t::edge>(G, light_edge, context);
         int sms = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
         tc_heavy_kernel<<<sms * 16, 256, 0, stream>>>(G, vertex_triangles_count, P->heavy.data().get(),
