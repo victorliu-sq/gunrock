@@ -197,6 +197,7 @@ class engine_t {
     expand_s = t_expand_;
     blossom_s = t_blossom_;
   }
+  double InitSeconds() const { return t_init_; }
   size_t Steps() const { return steps_; }
   // Memory footprint of the blossom phase: the most nodes the blossom buffer
   // held in a step (mat only), the most entries the blossom lists held in a
@@ -222,7 +223,7 @@ class engine_t {
   bool nomat_;
   bool base_rootpath_;
   size_t nnodes_;
-  double t_aug_{0}, t_expand_{0}, t_blossom_{0};
+  double t_aug_{0}, t_expand_{0}, t_blossom_{0}, t_init_{0};
   size_t steps_{0}, peak_buffer_{0}, peak_list_{0}, peak_tasks_{0};
   bool count_{false};
   size_t blossoms_{0};
@@ -254,10 +255,26 @@ class engine_t {
   frontier_t output_frontier_;  // unused: the advances write no output frontier
   thrust::device_vector<edge_t> segments_;
 
+  // GACGE_XB_PHASE_SYNC (default 1): a device synchronization at the end of
+  // init, expand and blossom, so each phase's host-clock time holds its own
+  // kernels (augment already ends with the found flag copied back). 0: no
+  // extra synchronization; expand's kernels then run into blossom's time.
+  static bool PhaseSync() {
+    static const bool on = [] {
+      const char* e = std::getenv("GACGE_XB_PHASE_SYNC");
+      return e == nullptr || e[0] != '0';
+    }();
+    return on;
+  }
+
   void FindAndFlipAugmentingPath() {
-    InitAlternatingForest();
     using clock = std::chrono::high_resolution_clock;
     auto secs = [](clock::time_point a, clock::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    const bool sync = PhaseSync();
+    auto ti = clock::now();
+    InitAlternatingForest();
+    if (sync) cudaDeviceSynchronize();
+    t_init_ += secs(ti, clock::now());
     while (true) {
       if (IsExhausted()) break;
       auto t0 = clock::now();
@@ -266,9 +283,11 @@ class engine_t {
       t_aug_ += secs(t0, t1);
       if (found) break;
       ExpandAlternatingForest();
+      if (sync) cudaDeviceSynchronize();
       auto t2 = clock::now();
       t_expand_ += secs(t1, t2);
       TransformOddNodesInBlossom();
+      if (sync) cudaDeviceSynchronize();
       auto t3 = clock::now();
       t_blossom_ += secs(t2, t3);
       steps_++;

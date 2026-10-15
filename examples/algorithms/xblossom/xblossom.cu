@@ -134,8 +134,8 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
                 valid ? 1 : 0);
     double aug_s, expand_s, blossom_s;
     engine.PhaseSeconds(aug_s, expand_s, blossom_s);
-    std::printf("XBPhases: index=%d aug_path_s=%.9f expand_s=%.9f blossom_s=%.9f steps=%zu\n", i - o.warmup, aug_s,
-                expand_s, blossom_s, engine.Steps());
+    std::printf("XBPhases: index=%d aug_path_s=%.9f expand_s=%.9f blossom_s=%.9f init_s=%.9f steps=%zu\n",
+                i - o.warmup, aug_s, expand_s, blossom_s, engine.InitSeconds(), engine.Steps());
     std::printf("XBMemory: index=%d paths_used=%zu blossom_buffer_peak=%zu blossom_list_peak=%zu "
                 "buffer_capacity=%zu list_capacity=%zu transform_tasks_peak=%zu table_bytes=%zu flip_stack_peak=%d\n",
                 i - o.warmup, engine.PathsUsed(), engine.PeakBlossomBufferNodes(), engine.PeakBlossomListEntries(),
