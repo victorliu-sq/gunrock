@@ -165,21 +165,46 @@ class engine_t {
     ts_imb_sum_ = 0;
     ts_imb_n_ = 0;
     if constexpr (kTuple) {
-      path_table_.EnableCounters(ts_on_);
+      path_table_.EnableCounters(ts_on_ || SearchStats());
       path_table_.ResetCounters();
     }
     dev_matching_.Fill(static_cast<index_t>(nnodes_));
     cudaDeviceSynchronize();
   }
 
+  // GACGE_XB_SEARCHES=1: one XBSearch line per search of the first matching
+  // (its steps, the augmenting paths it found, and the augment claims that
+  // took the first tree, failed on the second and released the first).
+  static bool SearchStats() {
+    static const bool on = std::getenv("GACGE_XB_SEARCHES") != nullptr;
+    return on;
+  }
+
   // Timed: the searches, from the empty matching to the maximum one.
   void Match() {
+    const bool stats = SearchStats() && ts_run_ == 0;
+    size_t search_index = 0;
+    auto search = [&]() {
+      const size_t steps0 = steps_;
+      unsigned long long paths0 = 0;
+      if constexpr (kTuple) {
+        if (stats) paths0 = path_table_.AugmentingPaths();
+      }
+      if (stats) dev_conflicts_.SetH2D(0);
+      FindAndFlipAugmentingPath();
+      if (stats) {
+        unsigned long long paths = 0;
+        if constexpr (kTuple) paths = path_table_.AugmentingPaths() - paths0;
+        std::printf("XBSearch: index=%zu steps=%zu paths=%llu claim_conflicts=%llu\n", search_index++,
+                    steps_ - steps0, paths, dev_conflicts_.GetD2H());
+      }
+    };
     found_ = DFLAG_FALSE;
     size_t searches = 1;
-    FindAndFlipAugmentingPath();
+    search();
     while (found_ == DFLAG_TRUE) {
       found_ = DFLAG_FALSE;
-      FindAndFlipAugmentingPath();
+      search();
       searches++;
     }
     if (ts_on_) {
@@ -254,6 +279,7 @@ class engine_t {
   DArray<index_t> dev_matching_;
   DValue<DFlag> dev_found_;
   DValue<unsigned long long> dev_blossoms_; // counter builds: closing edges of this step (nomat)
+  DValue<unsigned long long> dev_conflicts_; // GACGE_XB_SEARCHES: augment claims released this search
   path_table_t path_table_;
   DArray<DFlag> is_even_;
   DArray<index_t> tree_roots_;
@@ -446,6 +472,8 @@ class engine_t {
     ts_phase_ = 0;
     if (LoadFrontier() == 0) return false;
     const index_t nnodes = nnodes_;
+    const bool search_stats = SearchStats();
+    auto conflicts_v = dev_conflicts_.DeviceView();
     auto matching_v = dev_matching_.DeviceView();
     auto path_table_v = path_table_.DeviceView();
     auto is_even_v = is_even_.DeviceView();
@@ -468,6 +496,7 @@ class engine_t {
         if (atomicExch(&locks[first_lock], DFLAG_TRUE) != DFLAG_FALSE) return false;
         if (atomicExch(&locks[second_lock], DFLAG_TRUE) != DFLAG_FALSE) {
           locks[first_lock] = DFLAG_FALSE;
+          if (search_stats) atomicAdd(&conflicts_v, 1ULL);
           return false;
         }
         path_table.AddAugmentingPath(v, w, matching);
