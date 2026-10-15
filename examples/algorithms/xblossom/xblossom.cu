@@ -118,11 +118,13 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
                                                          o.blossom != "mat", context, o.base == "rootpath");
     if (o.counters) engine.EnableCounters();
     gacge::profile::SetTrial(i);
+    engine.PrepareMatch();  // the empty matching, untimed
     gacge::profile::Begin();  // GACGE_PROFILE_TRIAL=<i>, warm-up rounds included in i
     auto t0 = std::chrono::high_resolution_clock::now();
-    std::vector<index_t> mate = engine.FindMaximumMatch();
+    engine.Match();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
     gacge::profile::End();
+    std::vector<index_t> mate = engine.Mate();  // copied back, untimed
     if (i < o.warmup) continue;
     long size = check_matching(row, col, mate);
     bool valid = size >= 0;

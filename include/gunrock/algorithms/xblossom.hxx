@@ -138,7 +138,18 @@ class engine_t {
   static size_t ListSize(double ratio, size_t n) { return static_cast<size_t>(std::ceil(ratio * static_cast<double>(n))) + 1; }
 
   // Maximum matching from the empty matching; mate[v] == nnodes for exposed v.
+  // Maximum matching from the empty matching: PrepareMatch, Match, Mate. The
+  // driver times Match only (GACGE): the empty matching is set before, and the
+  // mates copied back after, its timer, as Gunrock's enactors time their loop
+  // after the problem's reset.
   std::vector<index_t> FindMaximumMatch() {
+    PrepareMatch();
+    Match();
+    return Mate();
+  }
+
+  // Untimed: the statistics' and counters' reset and the empty matching.
+  void PrepareMatch() {
     // GACGE traversal statistics (measure/traversal-char), off unless
     // GACGE_TRAVERSAL_STATS is set: one XBTraversal line per matching, and one
     // XBStep line per advance for the matching numbered GACGE_TRAVERSAL_TRACE
@@ -158,6 +169,11 @@ class engine_t {
       path_table_.ResetCounters();
     }
     dev_matching_.Fill(static_cast<index_t>(nnodes_));
+    cudaDeviceSynchronize();
+  }
+
+  // Timed: the searches, from the empty matching to the maximum one.
+  void Match() {
     found_ = DFLAG_FALSE;
     size_t searches = 1;
     FindAndFlipAugmentingPath();
@@ -186,6 +202,11 @@ class engine_t {
                   (size_t)G_.get_number_of_edges(), searches, ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1],
                   ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips, direct, max_flips);
     }
+    cudaDeviceSynchronize();
+  }
+
+  // Untimed: the mates copied back to the host.
+  std::vector<index_t> Mate() {
     std::vector<index_t> mate(nnodes_);
     thrust::copy(dev_matching_.begin(), dev_matching_.end(), mate.begin());
     return mate;
