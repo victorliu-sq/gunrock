@@ -36,6 +36,17 @@ inline bool pr_vertex() {
   return v;
 }
 
+// GACGE_PR=nr: the same pull with Gunrock's neighborreduce operator (as its
+// spmv): each edge yields its neighbor's contribution and a segmented reduction
+// (moderngpu, merge-path balanced) sums every vertex's edges, no atomics.
+inline bool pr_nr() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_PR");
+    return e != nullptr && std::string(e) == "nr";
+  }();
+  return v;
+}
+
 inline bool pr_pull() {
   static const bool pull = [] {
     const char* e = std::getenv("GACGE_PR");
@@ -185,6 +196,17 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // contrib (in plast) = alpha * p / deg, then p = (1 - alpha) / n + sum
       thrust::transform(policy, p, p + n_vertices, iweights, plast,
                         thrust::multiplies<weight_t>());
+      if (pr_nr()) {
+        auto edge_contrib = [G, plast] __host__ __device__(edge_t edge) -> weight_t {
+          return plast[G.get_destination_vertex(edge)];
+        };
+        auto plus_t = [] __host__ __device__(weight_t a, weight_t b) { return a + b; };
+        operators::neighborreduce::execute(G, E, p, edge_contrib, plus_t, weight_t(0), context);
+        const weight_t base = weight_t((1 - alpha) / n_vertices);
+        thrust::transform(policy, p, p + n_vertices, p,
+                          [base] __host__ __device__(weight_t x) { return base + x; });
+        return;
+      }
       if (pr_vertex()) {
         const weight_t base = weight_t((1 - alpha) / n_vertices);
         auto pull = [G, plast, p, base] __device__(vertex_t const& v) {
