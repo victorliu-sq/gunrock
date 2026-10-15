@@ -13,8 +13,6 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
 
-#include <cub/block/block_scan.cuh>
-
 #include <cstdlib>
 #include <string>
 
@@ -34,63 +32,6 @@ inline bool pr_pull() {
     return e == nullptr || std::string(e) != "push";
   }();
   return pull;
-}
-// GACGE_PR=block: the same pull block-mapped as Gunrock's block_mapped advance
-// (TPB consecutive vertices per block, their edges spread over the threads by a
-// block-wide degree scan and a binary search in shared memory); a thread adds
-// the contributions of consecutive edges of one vertex in a register and folds
-// them into that vertex's shared-memory sum when its vertex changes, and the
-// block writes each rank once (no global atomics).
-inline bool pr_block() {
-  static const bool v = [] {
-    const char* e = std::getenv("GACGE_PR");
-    return e != nullptr && std::string(e) == "block";
-  }();
-  return v;
-}
-
-template <int TPB, typename graph_t, typename weight_t>
-__global__ void __launch_bounds__(TPB)
-    pull_block_kernel(graph_t G, const weight_t* __restrict__ contrib, weight_t* __restrict__ p,
-                      std::size_t n, weight_t base) {
-  using vertex_t = typename graph_t::vertex_type;
-  using edge_t = typename graph_t::edge_type;
-  using scan_t = cub::BlockScan<edge_t, TPB>;
-  __shared__ typename scan_t::TempStorage scan;
-  __shared__ edge_t offset[TPB];
-  __shared__ edge_t start[TPB];
-  __shared__ weight_t sum[TPB];
-  const int t = threadIdx.x;
-  const std::size_t first = static_cast<std::size_t>(blockIdx.x) * TPB;
-  const std::size_t v = first + t;
-  edge_t degree = 0;
-  if (v < n) {
-    start[t] = G.get_starting_edge(static_cast<vertex_t>(v));
-    degree = G.get_number_of_neighbors(static_cast<vertex_t>(v));
-  }
-  sum[t] = 0;
-  edge_t mine, total;
-  scan_t(scan).ExclusiveSum(degree, mine, total);
-  offset[t] = mine;
-  __syncthreads();
-  int cur = -1;
-  weight_t acc = 0;
-  for (edge_t i = t; i < total; i += TPB) {
-    int lo = 0, hi = TPB - 1;  // the vertex whose edge range holds i
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (offset[mid] <= i) lo = mid; else hi = mid - 1;
-    }
-    if (lo != cur) {
-      if (cur >= 0) atomicAdd(&sum[cur], acc);
-      cur = lo;
-      acc = 0;
-    }
-    acc += contrib[G.get_destination_vertex(start[lo] + (i - offset[lo]))];
-  }
-  if (cur >= 0) atomicAdd(&sum[cur], acc);
-  __syncthreads();
-  if (v < n) p[v] = base + sum[t];
 }
 
 template <typename graph_t, typename weight_t>
@@ -235,13 +176,6 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       thrust::transform(policy, p, p + n_vertices, iweights, plast,
                         thrust::multiplies<weight_t>());
       const std::size_t threads = 256;
-      if (pr_block()) {
-        const std::size_t blocks = (static_cast<std::size_t>(n_vertices) + threads - 1) / threads;
-        pull_block_kernel<256><<<blocks, threads, 0, this->context->get_context(0)->stream()>>>(
-            G, plast, p, static_cast<std::size_t>(n_vertices), weight_t((1 - alpha) / n_vertices));
-        error::throw_if_exception(cudaGetLastError(), "pr pull block kernel");
-        return;
-      }
       const std::size_t blocks =
           (static_cast<std::size_t>(n_vertices) * 32 + threads - 1) / threads;
       pull_warp_kernel<<<blocks, threads, 0,

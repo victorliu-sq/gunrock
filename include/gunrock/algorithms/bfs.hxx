@@ -11,66 +11,8 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 
-#include <cub/block/block_scan.cuh>
-
-#include <cstdlib>
-#include <string>
-
 namespace gunrock {
 namespace bfs {
-
-// GACGE_BFS_PULL=block: the pull step block-mapped as Gunrock's block_mapped
-// advance (each block takes TPB consecutive vertices, a block-wide scan of their
-// degrees spreads all their edges over the block's threads, each thread finds
-// its edge's vertex by a binary search in shared memory), visited vertices
-// taking no edges, plus an early exit: once a vertex finds a parent in the level,
-// a shared flag makes the threads skip its remaining edges. Default (vertex):
-// one thread per vertex (parallel_for), which stops at the first parent.
-inline bool pull_block() {
-  static const bool v = [] {
-    const char* e = std::getenv("GACGE_BFS_PULL");
-    return e != nullptr && std::string(e) == "block";
-  }();
-  return v;
-}
-
-template <int TPB, typename graph_t, typename vertex_t>
-__global__ void __launch_bounds__(TPB)
-    pull_block_kernel(graph_t G, vertex_t* distances, vertex_t n, vertex_t level, vertex_t unvisited) {
-  using edge_t = typename graph_t::edge_type;
-  using scan_t = cub::BlockScan<edge_t, TPB>;
-  __shared__ typename scan_t::TempStorage scan;
-  __shared__ edge_t offset[TPB];  // exclusive prefix sum of the block's degrees
-  __shared__ edge_t start[TPB];   // first edge of each vertex
-  __shared__ int found[TPB];
-  const int t = threadIdx.x;
-  const vertex_t first = static_cast<vertex_t>(blockIdx.x) * TPB, v = first + t;
-  edge_t degree = 0;
-  if (v < n && distances[v] == unvisited) {
-    start[t] = G.get_starting_edge(v);
-    degree = G.get_number_of_neighbors(v);
-  }
-  found[t] = 0;
-  edge_t mine, total;
-  scan_t(scan).ExclusiveSum(degree, mine, total);
-  offset[t] = mine;
-  __syncthreads();
-  volatile int* done = found;
-  for (edge_t i = t; i < total; i += TPB) {
-    // the vertex whose edge range holds i (the last offset <= i)
-    int lo = 0, hi = TPB - 1;
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (offset[mid] <= i) lo = mid; else hi = mid - 1;
-    }
-    if (done[lo]) continue;  // this vertex has its parent
-    const vertex_t u = G.get_destination_vertex(start[lo] + (i - offset[lo]));
-    if (distances[u] == level) {
-      done[lo] = 1;
-      distances[first + lo] = level + 1;  // every writer stores the same value
-    }
-  }
-}
 
 template <typename vertex_t>
 struct param_t {
@@ -175,15 +117,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           break;
         }
     };
-    if (pull_block()) {
-      constexpr int TPB = 256;
-      const vertex_t nv = G.get_number_of_vertices();
-      pull_block_kernel<TPB><<<(nv + TPB - 1) / TPB, TPB, 0, this->context->get_context(0)->stream()>>>(
-          G, distances, nv, level, unvisited);
-      error::throw_if_exception(cudaGetLastError(), "bfs pull block kernel");
-    } else {
-      operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, pull, context);
-    }
+    operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, pull, context);
     // the next frontier: the vertices this step reached
     const vertex_t n = G.get_number_of_vertices();
     auto* out = this->get_output_frontier();
