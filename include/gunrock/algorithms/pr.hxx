@@ -26,6 +26,16 @@ namespace pr {
 // 32 lanes). Used with a fixed iteration count (max_iters > 0, GACGE_PR_ITERS);
 // GACGE_PR=push, or no fixed count, runs Gunrock's push PageRank (atomicAdd per
 // edge, dangling mass redistributed).
+// GACGE_PR=vertex: the same pull with Gunrock's parallel_for over the
+// vertices (one thread per vertex sums its neighbors' contributions).
+inline bool pr_vertex() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_PR");
+    return e != nullptr && std::string(e) == "vertex";
+  }();
+  return v;
+}
+
 inline bool pr_pull() {
   static const bool pull = [] {
     const char* e = std::getenv("GACGE_PR");
@@ -175,6 +185,17 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // contrib (in plast) = alpha * p / deg, then p = (1 - alpha) / n + sum
       thrust::transform(policy, p, p + n_vertices, iweights, plast,
                         thrust::multiplies<weight_t>());
+      if (pr_vertex()) {
+        const weight_t base = weight_t((1 - alpha) / n_vertices);
+        auto pull = [G, plast, p, base] __device__(vertex_t const& v) {
+          weight_t sum = 0;
+          for (auto e = G.get_starting_edge(v), end = G.get_starting_edge(v + 1); e < end; ++e)
+            sum += plast[G.get_destination_vertex(e)];
+          p[v] = base + sum;
+        };
+        operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, pull, context);
+        return;
+      }
       const std::size_t threads = 256;
       const std::size_t blocks =
           (static_cast<std::size_t>(n_vertices) * 32 + threads - 1) / threads;
