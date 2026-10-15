@@ -26,6 +26,7 @@
 //   XBResult: status matching_size valid rounds mean_runtime_s
 #include <gunrock/io/gacge_bin.hxx>
 #include <gunrock/algorithms/xblossom.hxx>
+#include <gunrock/gacge_profile.hxx>
 
 #include <chrono>
 #include <cstdio>
@@ -116,9 +117,12 @@ int run(graph_t& G, const options_t& o, const std::vector<int>& row, const std::
                                                          o.odd_node_ratio,
                                                          o.blossom != "mat", context, o.base == "rootpath");
     if (o.counters) engine.EnableCounters();
+    gacge::profile::SetTrial(i);
+    gacge::profile::Begin();  // GACGE_PROFILE_TRIAL=<i>, warm-up rounds included in i
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<index_t> mate = engine.FindMaximumMatch();
     double secs = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - t0).count();
+    gacge::profile::End();
     if (i < o.warmup) continue;
     long size = check_matching(row, col, mate);
     bool valid = size >= 0;

@@ -8,6 +8,7 @@
  *
  */
 
+#include <gunrock/gacge_profile.hxx>
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
@@ -287,6 +288,7 @@ struct enactor_t {
     std::size_t t_steps = 0, t_v = 0, t_e = 0, t_max_e = 0, t_small = 0, t_imb_n = 0;
     double t_imb = 0;  // sum over steps of max degree / mean degree of the frontier
     auto timer = single_context->timer();
+    gacge::profile::Begin();  // GACGE_PROFILE_TRIAL (gacge_profile.hxx)
     timer.begin();
     while (!is_converged(*context)) {
       if (stats) {
@@ -305,6 +307,7 @@ struct enactor_t {
     }
     finalize(*context);
     auto runtime = timer.end();
+    gacge::profile::End();
     if (stats)
       std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
                   "imbalance=%.3f nodes=%zu edges=%zu\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,

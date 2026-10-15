@@ -76,6 +76,7 @@ void test_pr(int num_arguments, char** argument_array) {
   auto benchmark_metrics =
       std::vector<benchmark::host_benchmark_t>(params.num_runs);
   for (int i = 0; i < params.num_runs; i++) {
+    gacge::profile::SetTrial(i);
     benchmark::INIT_BENCH();
 
     int iterations = 0;

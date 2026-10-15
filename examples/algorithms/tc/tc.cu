@@ -254,6 +254,7 @@ void test_tc(int num_arguments, char** argument_array) {
   std::size_t total_triangles = 0;
   std::vector<float> run_times;
   for (int i = 0; i < params.num_runs; i++) {
+    gacge::profile::SetTrial(i);
     thrust::fill(triangles_count.begin(), triangles_count.end(), 0);
     total_triangles = 0;
     auto ctx = std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0));
@@ -261,6 +262,7 @@ void test_tc(int num_arguments, char** argument_array) {
       cudaEvent_t t0, t1;
       cudaEventCreate(&t0);
       cudaEventCreate(&t1);
+      gacge::profile::Begin();  // the relabelling is timed (and profiled) with the count
       cudaEventRecord(t0);
       csr_t rcsr;
       relabel_by_degree(csr, rcsr);
