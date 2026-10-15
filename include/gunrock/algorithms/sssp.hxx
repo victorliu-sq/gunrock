@@ -10,7 +10,6 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
-#include <gunrock/algorithms/gacge_lb.hxx>
 
 namespace gunrock {
 namespace sssp {
@@ -136,7 +135,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
 
     // Execute advance operator on the provided lambda
-    gacge::advance(G, E, shortest_path, context);  // GACGE_LB
+    operators::advance::execute<operators::load_balance_t::block_mapped>(
+        G, E, shortest_path, context);
 
     // Execute filter operator on the provided lambda
     operators::filter::execute<operators::filter_algorithm_t::bypass>(

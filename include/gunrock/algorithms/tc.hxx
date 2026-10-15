@@ -10,7 +10,6 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
-#include <gunrock/algorithms/gacge_lb.hxx>
 #include <gunrock/util/timer.hxx>
 
 #include <cstdlib>
@@ -19,18 +18,20 @@
 namespace gunrock {
 namespace tc {
 
-// GACGE: how the oriented count is spread over the GPU. GACGE_TC=advance:
-// an advance (GACGE_LB) over the edges of a frontier holding every vertex.
-// Default: one thread per edge (parallel_for over the edges, the source found
-// by a binary search in the row offsets). Gunrock's block_mapped advance runs
-// all of a vertex's edges in one 256-thread block (Arabic's 575K-degree
-// vertices: over 20 min a round, one SM busy).
-inline bool tc_advance() {
-  static const bool v = [] {
-    const char* e = std::getenv("GACGE_TC");
-    return e != nullptr && std::string(e) == "advance";
+// GACGE: how the oriented count is spread over the GPU. By default one thread
+// per edge (parallel_for over the edges, the source found by a binary search
+// in the row offsets): a high-degree vertex's merges are spread over the whole
+// GPU, as Ligra Triangle's dense_parallel spreads them over the workers.
+// Gunrock's block_mapped advance ran all of a vertex's edges in one 256-thread
+// block (Arabic's 575K-degree vertices: over 20 min a round, one SM busy);
+// GACGE_TC_LB=block restores it. (merge_path, the edge-balanced advance, faults
+// on this graph-as-frontier advance.)
+inline bool tc_block_mapped() {
+  static const bool block = [] {
+    const char* e = std::getenv("GACGE_TC_LB");
+    return e != nullptr && std::string(e) == "block";
   }();
-  return v;
+  return block;
 }
 
 template <typename vertex_t>
@@ -89,14 +90,6 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   using weight_t = typename problem_t::weight_t;
   using frontier_t = typename enactor_t<problem_t>::frontier_t;
 
-  // GACGE_TC=advance: every vertex, once, before the timed loop
-  void prepare_frontier(frontier_t* f,
-                        gcuda::multi_context_t& context) override {
-    if (tc_advance())
-      f->sequence((vertex_t)0, this->get_problem()->get_graph().get_number_of_vertices(),
-                  context.get_context(0)->stream());
-  }
-
   void loop(gcuda::multi_context_t& context) override {
     // Data slice
     auto E = this->get_enactor();
@@ -134,12 +127,12 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
         return false;
       };
-      if (tc_advance()) {
-        gacge::advance<operators::advance_direction_t::forward,
-                       operators::advance_io_type_t::vertices,
-                       operators::advance_io_type_t::none>(
-            G, oriented, E->get_input_frontier(), E->get_output_frontier(),
-            E->scanned_work_domain, context);
+      if (tc_block_mapped()) {
+        operators::advance::execute<operators::load_balance_t::block_mapped,
+                                    operators::advance_direction_t::forward,
+                                    operators::advance_io_type_t::graph,
+                                    operators::advance_io_type_t::none>(
+            G, E, oriented, context);
       } else {
         auto per_edge = [G, oriented] __device__(edge_t const& e) {
           oriented(G.get_source_vertex(e), G.get_destination_vertex(e), e,
