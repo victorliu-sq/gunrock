@@ -6,8 +6,137 @@
 
 #include <cxxopts.hpp>
 
+#include <cub/device/device_segmented_sort.cuh>
+#include <thrust/binary_search.h>
+#include <thrust/scan.h>
+#include <thrust/scatter.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <random>
+#include <string>
+#include <type_traits>
+
 using namespace gunrock;
 using namespace memory;
+
+// GACGE_TC_RELABEL: gap (default since 2026-10-15) counts as the GAP benchmark's
+// tc (Hybrid): when WorthRelabelling says the degrees are skewed, the graph is
+// first relabelled by decreasing degree (RelabelByDegree, here on the device),
+// inside the timed run as in GAP; off counts on the graph as loaded.
+
+// GAP's UniDist (gapbs src/generator.h, BSD), verbatim, so that the degree
+// sample of WorthRelabelling picks the same vertices as GAP's.
+template <typename NodeID_, typename rng_t_,
+          typename uNodeID_ = typename std::make_unsigned<NodeID_>::type>
+class UniDist {
+ public:
+  UniDist(NodeID_ max_value, rng_t_& rng) : rng_(rng) {
+    no_mod_ = rng_.max() == static_cast<uNodeID_>(max_value);
+    mod_ = max_value + 1;
+    uNodeID_ remainder_sub_1 = rng_.max() % mod_;
+    if (remainder_sub_1 == mod_ - 1)
+      cutoff_ = 0;
+    else
+      cutoff_ = rng_.max() - remainder_sub_1;
+  }
+  NodeID_ operator()() {
+    uNodeID_ rand_num = rng_();
+    if (no_mod_)
+      return rand_num;
+    if (cutoff_ != 0) {
+      while (rand_num >= cutoff_)
+        rand_num = rng_();
+    }
+    return rand_num % mod_;
+  }
+
+ private:
+  rng_t_& rng_;
+  bool no_mod_;
+  uNodeID_ mod_;
+  uNodeID_ cutoff_;
+};
+
+// GAP's WorthRelabelling (gapbs src/tc.cc) on the row offsets of a symmetric
+// graph with m directed entries (GAP's num_edges() is m / 2 for it)
+template <typename edge_t>
+bool gap_worth_relabelling(const std::vector<edge_t>& off) {
+  const int64_t n = (int64_t)off.size() - 1;
+  const int64_t num_edges = ((int64_t)off[n] - (int64_t)off[0]) / 2;
+  const int64_t average_degree = num_edges / n;
+  if (average_degree < 10)
+    return false;
+  std::mt19937_64 rng(27491095);  // GAP's kRandSeed
+  UniDist<int32_t, std::mt19937_64> udist((int32_t)(n - 1), rng);
+  auto degree = [&](int64_t v) { return (int64_t)off[v + 1] - (int64_t)off[v]; };
+  const int64_t num_samples = std::min<int64_t>(1000, n);
+  int64_t sample_total = 0;
+  std::vector<int64_t> samples(num_samples);
+  for (int64_t trial = 0; trial < num_samples; trial++) {
+    int32_t source;
+    do {
+      source = udist();
+    } while (degree(source) == 0);  // SourcePicker::PickNext
+    samples[trial] = degree(source);
+    sample_total += samples[trial];
+  }
+  std::sort(samples.begin(), samples.end());
+  const double sample_average = static_cast<double>(sample_total) / num_samples;
+  const double sample_median = samples[num_samples / 2];
+  return sample_average / 1.3 > sample_median;
+}
+
+// GAP's RelabelByDegree on the device: vertices sorted by (degree, id),
+// largest first, take ids 0, 1, ...; every list is mapped and sorted again.
+template <typename csr_t>
+void relabel_by_degree(const csr_t& in, csr_t& out) {
+  using vertex_t = typename csr_t::index_type;
+  using edge_t = typename csr_t::offset_type;
+  const vertex_t n = in.number_of_rows;
+  const edge_t m = in.number_of_nonzeros;
+  const edge_t* off = thrust::raw_pointer_cast(in.row_offsets.data());
+  const vertex_t* col = thrust::raw_pointer_cast(in.column_indices.data());
+  thrust::device_vector<unsigned long long> key(n);
+  thrust::device_vector<vertex_t> order(n), new_ids(n);
+  thrust::transform(thrust::counting_iterator<vertex_t>(0), thrust::counting_iterator<vertex_t>(n),
+                    key.begin(), [off] __device__(vertex_t v) {
+                      return ((unsigned long long)(off[v + 1] - off[v]) << 32) | (unsigned long long)v;
+                    });
+  thrust::sequence(order.begin(), order.end());
+  thrust::sort_by_key(key.begin(), key.end(), order.begin(), thrust::greater<unsigned long long>());
+  thrust::scatter(thrust::counting_iterator<vertex_t>(0), thrust::counting_iterator<vertex_t>(n),
+                  order.begin(), new_ids.begin());
+  out.number_of_rows = n;
+  out.number_of_columns = n;
+  out.number_of_nonzeros = m;
+  out.row_offsets.resize(n + 1);
+  const vertex_t* ord = thrust::raw_pointer_cast(order.data());
+  thrust::transform(thrust::counting_iterator<vertex_t>(0), thrust::counting_iterator<vertex_t>(n + 1),
+                    out.row_offsets.begin(), [off, ord, n] __device__(vertex_t k) -> edge_t {
+                      return k < n ? off[ord[k] + 1] - off[ord[k]] : 0;
+                    });
+  thrust::exclusive_scan(out.row_offsets.begin(), out.row_offsets.end(), out.row_offsets.begin());
+  thrust::device_vector<vertex_t> mapped(m);
+  out.column_indices.resize(m);
+  const edge_t* noff = thrust::raw_pointer_cast(out.row_offsets.data());
+  const vertex_t* nid = thrust::raw_pointer_cast(new_ids.data());
+  vertex_t* mc = thrust::raw_pointer_cast(mapped.data());
+  thrust::for_each(thrust::counting_iterator<edge_t>(0), thrust::counting_iterator<edge_t>(m),
+                   [off, col, noff, nid, mc, n] __device__(edge_t e) {
+                     const vertex_t u = (vertex_t)(thrust::upper_bound(thrust::seq, off, off + n + 1, e) - off - 1);
+                     mc[noff[nid[u]] + (e - off[u])] = nid[col[e]];
+                   });
+  std::size_t temp_bytes = 0;
+  vertex_t* oc = thrust::raw_pointer_cast(out.column_indices.data());
+  cub::DeviceSegmentedSort::SortKeys(nullptr, temp_bytes, mc, oc, (int64_t)m, (int64_t)n, noff, noff + 1);
+  thrust::device_vector<unsigned char> temp(temp_bytes);
+  cub::DeviceSegmentedSort::SortKeys(thrust::raw_pointer_cast(temp.data()), temp_bytes, mc, oc, (int64_t)m,
+                                     (int64_t)n, noff, noff + 1);
+}
 
 struct parameters_t {
   std::string filename;
@@ -110,17 +239,47 @@ void test_tc(int num_arguments, char** argument_array) {
   // --
   // GPU Run
 
-  // -n runs, each from zeroed per-vertex counts (tc::run adds into them)
+  // GACGE_TC_RELABEL (default gap): relabel by degree when GAP would
+  const char* rl = std::getenv("GACGE_TC_RELABEL");
+  bool relabel = !params.all_edges && (rl == nullptr || std::string(rl) == "gap");
+  if (relabel) {
+    std::vector<edge_t> h_off(n_vertices + 1);
+    thrust::copy(csr.row_offsets.begin(), csr.row_offsets.end(), h_off.begin());
+    relabel = gap_worth_relabelling(h_off);
+  }
+  std::cout << "TCRelabel: " << (relabel ? 1 : 0) << std::endl;
+
+  // -n runs, each from zeroed per-vertex counts (tc::run adds into them); a
+  // relabelled run times the relabelling too (GAP's Hybrid does)
   std::size_t total_triangles = 0;
   std::vector<float> run_times;
   for (int i = 0; i < params.num_runs; i++) {
     thrust::fill(triangles_count.begin(), triangles_count.end(), 0);
     total_triangles = 0;
-    run_times.push_back(tc::run(
-        G, params.reduce_all_triangles, triangles_count.data().get(),
-        &total_triangles,
-        std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0)),
-        !params.all_edges));
+    auto ctx = std::shared_ptr<gcuda::multi_context_t>(new gcuda::multi_context_t(0));
+    if (relabel) {
+      cudaEvent_t t0, t1;
+      cudaEventCreate(&t0);
+      cudaEventCreate(&t1);
+      cudaEventRecord(t0);
+      csr_t rcsr;
+      relabel_by_degree(csr, rcsr);
+      auto RG = graph::build<memory_space_t::device>(properties, rcsr);
+      RG.alias_values(reinterpret_cast<weight_t*>(thrust::raw_pointer_cast(rcsr.column_indices.data())));
+      cudaEventRecord(t1);
+      cudaEventSynchronize(t1);
+      float relabel_ms = 0;
+      cudaEventElapsedTime(&relabel_ms, t0, t1);
+      const float count_ms = tc::run(RG, params.reduce_all_triangles, triangles_count.data().get(),
+                                     &total_triangles, ctx, !params.all_edges);
+      run_times.push_back(relabel_ms + count_ms);
+      std::cout << "TCRelabelTime: relabel_ms=" << relabel_ms << " count_ms=" << count_ms << std::endl;
+      cudaEventDestroy(t0);
+      cudaEventDestroy(t1);
+    } else {
+      run_times.push_back(tc::run(G, params.reduce_all_triangles, triangles_count.data().get(),
+                                  &total_triangles, ctx, !params.all_edges));
+    }
     std::cout << "TCResult: total=" << total_triangles
               << " oriented=" << !params.all_edges << std::endl;
   }

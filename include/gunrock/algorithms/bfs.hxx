@@ -11,8 +11,25 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 
+#include <cstdlib>
+#include <string>
+
 namespace gunrock {
 namespace bfs {
+
+// GACGE_BFS_RULE: how a direction-optimized BFS picks a step's direction.
+// gap (default since 2026-10-15, the GAP benchmark's DOBFS, alpha 15, beta 18):
+// switch to pull when the edges of the vertices the last push found exceed the
+// edges left unexamined / alpha; keep pulling while a pull wakes at least as
+// many vertices as the one before or more than |V| / beta, then push again.
+// ligra: pull when the frontier's vertices plus edges exceed 5% of the edges.
+inline bool rule_gap() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_BFS_RULE");
+    return e == nullptr || std::string(e) == "gap";
+  }();
+  return v;
+}
 
 template <typename vertex_t>
 struct param_t {
@@ -80,31 +97,75 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
                         gcuda::multi_context_t& context) override {
     auto P = this->get_problem();
     f->push_back(P->param.single_source);
+    gap_pulling = false;
+    gap_started = false;
   }
 
-  // Direction-optimized BFS: decides the step's direction by Ligra's rule and,
-  // for a pull step, runs it and makes the next frontier; false: push.
-  bool pull_step(gcuda::multi_context_t& context) {
-    auto P = this->get_problem();
-    auto G = P->get_graph();
-    auto distances = P->result.distances;
+  // GAP rule state (rule_gap): edges not yet examined, the edges of the last
+  // push's new vertices, the vertices the last pull woke, pulling or pushing
+  long long gap_edges_to_check = 0, gap_scout = 0, gap_old_awake = 0;
+  bool gap_pulling = false, gap_started = false;
+
+  // the input frontier's valid vertices and the sum of their degrees
+  void frontier_size(std::size_t& n_f, std::size_t& m_f) {
+    auto G = this->get_problem()->get_graph();
     auto policy = this->context->get_context(0)->execution_policy();
     auto* in = this->get_input_frontier();
     const std::size_t len = in->get_number_of_elements();
     const vertex_t* f = in->data();
-    // the frontier's vertices and their edges (push frontiers carry invalids)
-    const std::size_t n_f = thrust::count_if(policy, f, f + len, [] __host__ __device__(vertex_t v) {
+    n_f = thrust::count_if(policy, f, f + len, [] __host__ __device__(vertex_t v) {
       return gunrock::util::limits::is_valid(v);
     });
-    const std::size_t m_f = thrust::transform_reduce(
+    m_f = thrust::transform_reduce(
         policy, f, f + len,
         [G] __host__ __device__(vertex_t v) -> std::size_t {
           return gunrock::util::limits::is_valid(v) ? (std::size_t)G.get_number_of_neighbors(v) : 0;
         },
         std::size_t{0}, thrust::plus<std::size_t>());
+  }
+
+  // Direction-optimized BFS: decides the step's direction (rule_gap: GAP's
+  // DOBFS; otherwise Ligra's rule) and, for a pull step, runs it and makes the
+  // next frontier; false: push.
+  bool pull_step(gcuda::multi_context_t& context) {
+    auto G = this->get_problem()->get_graph();
     const std::size_t m = G.get_number_of_edges();
-    if (n_f + m_f <= m / 20)
-      return false;
+    std::size_t n_f = 0, m_f = 0;
+    if (!rule_gap()) {
+      frontier_size(n_f, m_f);
+      return n_f + m_f > m / 20 ? do_pull(context) >= 0 : false;
+    }
+    if (!gap_started) {  // the source's degree
+      gap_started = true;
+      frontier_size(n_f, m_f);
+      gap_edges_to_check = (long long)m;
+      gap_scout = (long long)m_f;
+    }
+    if (!gap_pulling && gap_scout > gap_edges_to_check / 15) {
+      frontier_size(n_f, m_f);
+      gap_pulling = true;
+      gap_old_awake = (long long)n_f;
+    }
+    if (gap_pulling) {
+      const long long awake = do_pull(context);
+      const long long n = G.get_number_of_vertices();
+      if (!(awake >= gap_old_awake || awake > n / 18)) {
+        gap_pulling = false;
+        gap_scout = 1;
+      }
+      gap_old_awake = awake;
+      return true;
+    }
+    gap_edges_to_check -= gap_scout;
+    return false;
+  }
+
+  // one pull step; returns the vertices it woke (the next frontier's size)
+  long long do_pull(gcuda::multi_context_t& context) {
+    auto P = this->get_problem();
+    auto G = P->get_graph();
+    auto distances = P->result.distances;
+    auto policy = this->context->get_context(0)->execution_policy();
     const vertex_t level = this->iteration;
     const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
     auto pull = [G, distances, level, unvisited] __host__ __device__(vertex_t const& v) {
@@ -130,7 +191,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
                                });
     out->set_number_of_elements(end - o);
     this->swap_frontier_buffers();
-    return true;
+    return (long long)(end - o);
   }
 
   void loop(gcuda::multi_context_t& context) override {
@@ -183,6 +244,13 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     // Execute advance operator on the provided lambda
     operators::advance::execute<operators::load_balance_t::block_mapped>(
         G, E, search, context);
+    // GAP rule: the next step's scout count, the degrees of the vertices this
+    // push found (the new input frontier; GAP adds them as it claims them)
+    if (P->param.direction_optimized && rule_gap()) {
+      std::size_t n_f = 0, m_f = 0;
+      frontier_size(n_f, m_f);
+      gap_scout = (long long)m_f;
+    }
 
     // Execute filter operator to remove the invalids.
     // @todo: Add CLI option to enable or disable this.

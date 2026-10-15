@@ -11,8 +11,40 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 
+#include <thrust/copy.h>
+#include <thrust/remove.h>
+#include <thrust/sort.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/unique.h>
+
+#include <climits>
+#include <cstdlib>
+#include <string>
+
 namespace gunrock {
 namespace sssp {
+
+// GACGE_SSSP: delta (default since 2026-10-15) is delta-stepping as in the GAP
+// benchmark's DeltaStep: each step relaxes the out-edges of the vertices in the
+// lowest non-empty bucket (distance / GACGE_SSSP_DELTA, default 1); improved
+// vertices join a pile, and the next frontier is the pile's lowest bucket
+// (deduplicated), which may be the same bucket again; a vertex whose distance
+// dropped since it joined is taken from its current bucket. bf: Gunrock's
+// frontier Bellman-Ford (every improved vertex is in the next frontier).
+inline bool sssp_delta() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_SSSP");
+    return e == nullptr || std::string(e) == "delta";
+  }();
+  return v;
+}
+inline double sssp_delta_width() {
+  static const double v = [] {
+    const char* e = std::getenv("GACGE_SSSP_DELTA");
+    return e ? std::atof(e) : 1.0;
+  }();
+  return v;
+}
 
 template <typename vertex_t>
 struct param_t {
@@ -46,6 +78,9 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using weight_t = typename graph_t::weight_type;
 
   thrust::device_vector<vertex_t> visited;
+  // sssp_delta: improved vertices not yet taken into a frontier
+  thrust::device_vector<vertex_t> pile;
+  std::size_t pile_size = 0;
 
   void init() override {
     auto g = this->get_graph();
@@ -74,6 +109,9 @@ struct problem_t : gunrock::problem_t<graph_t> {
 
     thrust::fill(policy, visited.begin(), visited.end(),
                  -1);  // This does need to be reset in between runs though
+    pile_size = 0;
+    if (sssp_delta() && pile.size() < (std::size_t)n_vertices)
+      pile.resize(n_vertices);
   }
 };
 
@@ -133,6 +171,51 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // return G.get_number_of_neighbors(vertex) > 0;
       return true;
     };
+
+    if (sssp_delta()) {
+      auto policy = this->context->get_context(0)->execution_policy();
+      auto* in = E->get_input_frontier();
+      auto* out = E->get_output_frontier();
+      operators::advance::execute<operators::load_balance_t::block_mapped,
+                                  operators::advance_direction_t::forward,
+                                  operators::advance_io_type_t::vertices,
+                                  operators::advance_io_type_t::vertices>(
+          G, shortest_path, in, out, E->scanned_work_domain, context);
+      // the improved vertices join the pile
+      auto& pile = P->pile;
+      const std::size_t added = out->get_number_of_elements();
+      const std::size_t old_size = P->pile_size;
+      if (pile.size() < old_size + added)
+        pile.resize(std::max(old_size + added, 2 * pile.size()));
+      vertex_t* pp = pile.data().get();
+      const vertex_t* o = out->data();
+      auto pend = thrust::copy_if(policy, o, o + added, pp + old_size,
+                                  [] __host__ __device__(vertex_t v) { return gunrock::util::limits::is_valid(v); });
+      std::size_t size = pend - pp;
+      if (size == 0) {
+        P->pile_size = 0;
+        in->set_number_of_elements(0);
+        return;
+      }
+      // the lowest bucket of the pile is the next frontier
+      const weight_t delta = (weight_t)sssp_delta_width();
+      auto bucket = [distances, delta] __host__ __device__(vertex_t v) -> long long {
+        return (long long)(distances[v] / delta);
+      };
+      const long long b = thrust::transform_reduce(policy, pp, pp + size, bucket, LLONG_MAX,
+                                                   thrust::minimum<long long>());
+      auto in_b = [distances, delta, b] __host__ __device__(vertex_t v) {
+        return (long long)(distances[v] / delta) == b;
+      };
+      in->reserve(size);
+      vertex_t* f = in->data();
+      vertex_t* fend = thrust::copy_if(policy, pp, pp + size, f, in_b);
+      P->pile_size = thrust::remove_if(policy, pp, pp + size, in_b) - pp;
+      thrust::sort(policy, f, fend);
+      fend = thrust::unique(policy, f, fend);
+      in->set_number_of_elements(fend - f);
+      return;
+    }
 
     // Execute advance operator on the provided lambda
     operators::advance::execute<operators::load_balance_t::block_mapped>(
