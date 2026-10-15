@@ -118,8 +118,9 @@ struct problem_t : gunrock::problem_t<graph_t> {
 template <typename problem_t>
 struct enactor_t : gunrock::enactor_t<problem_t> {
   enactor_t(problem_t* _problem,
-            std::shared_ptr<gcuda::multi_context_t> _context)
-      : gunrock::enactor_t<problem_t>(_problem, _context) {}
+            std::shared_ptr<gcuda::multi_context_t> _context,
+            enactor_properties_t _properties = enactor_properties_t())
+      : gunrock::enactor_t<problem_t>(_problem, _context, _properties) {}
 
   using vertex_t = typename problem_t::vertex_t;
   using edge_t = typename problem_t::edge_t;
@@ -261,7 +262,12 @@ float run(graph_t& G,
   problem.init();
   problem.reset();
 
-  enactor_type enactor(&problem, context);
+  // sssp_delta: a frontier holds one bucket; the advance sizes its output per
+  // step instead of the enactor's up-front |E| x 1.5 per buffer (13 GB on
+  // Arabic beside its 9 GB weighted graph)
+  enactor_properties_t props;
+  props.self_manage_frontiers = sssp_delta();
+  enactor_type enactor(&problem, context, props);
   return enactor.enact();
   // </boiler-plate>
 }
