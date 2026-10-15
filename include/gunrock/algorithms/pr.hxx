@@ -36,13 +36,16 @@ inline bool pr_vertex() {
   return v;
 }
 
-// GACGE_PR=nr: the same pull with Gunrock's neighborreduce operator (as its
-// spmv): each edge yields its neighbor's contribution and a segmented reduction
-// (moderngpu, merge-path balanced) sums every vertex's edges, no atomics.
+// Default (or GACGE_PR=nr, since 2026-10-15): the pull with Gunrock's
+// neighborreduce operator (as its spmv): each edge yields its neighbor's
+// contribution and a segmented reduction (moderngpu, merge-path balanced) sums
+// every vertex's edges, no atomics; 3.04x the CPU in geometric mean on the
+// eight graphs against 2.82x for the warp kernel (GACGE_PR=warp). Needs the
+// moderngpu fork's midpoint fix (eb98fb0) for graphs over 2^30 edges.
 inline bool pr_nr() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_PR");
-    return e != nullptr && std::string(e) == "nr";
+    return e == nullptr || std::string(e) == "nr";
   }();
   return v;
 }
