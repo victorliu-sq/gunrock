@@ -12,6 +12,9 @@
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/util/timer.hxx>
 
+#include <cub/block/block_scan.cuh>
+#include <thrust/binary_search.h>
+
 #include <cstdlib>
 #include <string>
 
@@ -32,6 +35,125 @@ inline bool tc_block_mapped() {
     return e != nullptr && std::string(e) == "block";
   }();
   return block;
+}
+
+// GACGE_TC=block: the oriented count block-mapped as Gunrock's block_mapped
+// advance (TPB consecutive vertices per block, their edges spread over the
+// threads by a block-wide degree scan and a shared-memory binary search); an
+// edge whose end points' degrees sum to at most GACGE_TC_HEAVY (default 1024)
+// is merged by its thread, a heavier one is queued and intersected by a whole
+// warp (the lanes take the shorter list's entries below d and binary-search
+// them in the longer one), so a hub's long intersections do not stall a warp
+// of short ones.
+inline bool tc_block() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_TC");
+    return e != nullptr && std::string(e) == "block";
+  }();
+  return v;
+}
+inline int tc_heavy() {
+  static const int v = [] {
+    const char* e = std::getenv("GACGE_TC_HEAVY");
+    return e ? std::atoi(e) : 1024;
+  }();
+  return v;
+}
+
+// |N(s) and N(d) below d| by a merge (Ligra's countCommon)
+template <typename graph_t, typename vertex_t>
+__device__ __forceinline__ vertex_t tc_merge(const graph_t& G, vertex_t s, vertex_t d) {
+  using edge_t = typename graph_t::edge_type;
+  edge_t i = G.get_starting_edge(s), ie = G.get_starting_edge(s + 1);
+  edge_t j = G.get_starting_edge(d), je = G.get_starting_edge(d + 1);
+  vertex_t count = 0;
+  while (i < ie && j < je) {
+    const vertex_t a = G.get_destination_vertex(i), b = G.get_destination_vertex(j);
+    if (a >= d || b >= d) break;
+    if (a < b) i++;
+    else if (b < a) j++;
+    else { count++; i++; j++; }
+  }
+  return count;
+}
+
+template <int TPB, typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(TPB)
+    tc_block_kernel(graph_t G, vertex_t* counts, typename graph_t::edge_type* heavy,
+                    unsigned long long* heavy_n, long long heavy_deg) {
+  using edge_t = typename graph_t::edge_type;
+  using scan_t = cub::BlockScan<edge_t, TPB>;
+  __shared__ typename scan_t::TempStorage scan;
+  __shared__ edge_t offset[TPB];
+  __shared__ edge_t start[TPB];
+  __shared__ edge_t deg[TPB];
+  const int t = threadIdx.x;
+  const vertex_t n = G.get_number_of_vertices();
+  const vertex_t first = static_cast<vertex_t>(blockIdx.x) * TPB, v = first + t;
+  edge_t degree = 0;
+  if (v < n) {
+    start[t] = G.get_starting_edge(v);
+    degree = G.get_number_of_neighbors(v);
+  }
+  deg[t] = degree;
+  edge_t mine, total;
+  scan_t(scan).ExclusiveSum(degree, mine, total);
+  offset[t] = mine;
+  __syncthreads();
+  int cur = -1;
+  vertex_t acc = 0;
+  for (edge_t i = t; i < total; i += TPB) {
+    int lo = 0, hi = TPB - 1;  // the vertex whose edge range holds i
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (offset[mid] <= i) lo = mid; else hi = mid - 1;
+    }
+    const vertex_t s = first + lo;
+    const edge_t e = start[lo] + (i - offset[lo]);
+    const vertex_t d = G.get_destination_vertex(e);
+    if (d >= s) continue;
+    if ((long long)deg[lo] + (long long)G.get_number_of_neighbors(d) > heavy_deg) {
+      heavy[atomicAdd(heavy_n, 1ULL)] = e;  // a warp intersects it
+      continue;
+    }
+    if (lo != cur) {
+      if (cur >= 0 && acc) math::atomic::add(&counts[first + cur], acc);
+      cur = lo;
+      acc = 0;
+    }
+    acc += tc_merge(G, s, d);
+  }
+  if (cur >= 0 && acc) math::atomic::add(&counts[first + cur], acc);
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void tc_heavy_kernel(graph_t G, vertex_t* counts, const typename graph_t::edge_type* heavy,
+                                const unsigned long long* heavy_n) {
+  using edge_t = typename graph_t::edge_type;
+  const unsigned long long warps = (static_cast<unsigned long long>(gridDim.x) * blockDim.x) >> 5;
+  const unsigned long long nheavy = *heavy_n;
+  const int lane = threadIdx.x & 31;
+  const auto col = G.get_column_indices();
+  for (unsigned long long k = (static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x) >> 5;
+       k < nheavy; k += warps) {
+    const edge_t e = heavy[k];
+    const vertex_t s = G.get_source_vertex(e), d = G.get_destination_vertex(e);
+    // both lists below d
+    const vertex_t* a = col + G.get_starting_edge(s);
+    const vertex_t* b = col + G.get_starting_edge(d);
+    const edge_t la = thrust::lower_bound(thrust::seq, a, a + G.get_number_of_neighbors(s), d) - a;
+    const edge_t lb = thrust::lower_bound(thrust::seq, b, b + G.get_number_of_neighbors(d), d) - b;
+    const vertex_t* shorter = la <= lb ? a : b;
+    const vertex_t* longer = la <= lb ? b : a;
+    const edge_t ls = la <= lb ? la : lb, ll = la <= lb ? lb : la;
+    vertex_t c = 0;
+    for (edge_t x = lane; x < ls; x += 32)
+      c += thrust::binary_search(thrust::seq, longer, longer + ll, shorter[x]) ? 1 : 0;
+    for (int o = 16; o > 0; o >>= 1)
+      c += __shfl_down_sync(0xffffffffu, c, o);
+    if (lane == 0 && c)
+      math::atomic::add(&counts[s], c);
+  }
 }
 
 template <typename vertex_t>
@@ -73,7 +195,16 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using vertex_t = typename graph_t::vertex_type;
   using edge_t = typename graph_t::edge_type;
 
-  void init() override {}
+  // GACGE_TC=block: the queue of heavy edges (one slot per edge) and its length
+  thrust::device_vector<edge_t> heavy;
+  thrust::device_vector<unsigned long long> heavy_n;
+
+  void init() override {
+    if (tc_block()) {
+      heavy.resize(this->get_graph().get_number_of_edges());
+      heavy_n.resize(1);
+    }
+  }
 
   void reset() override {}
 };
@@ -127,7 +258,21 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
         return false;
       };
-      if (tc_block_mapped()) {
+      if (tc_block()) {
+        constexpr int TPB = 256;
+        auto stream = this->context->get_context(0)->stream();
+        const vertex_t n = G.get_number_of_vertices();
+        unsigned long long* heavy_n = P->heavy_n.data().get();
+        cudaMemsetAsync(heavy_n, 0, sizeof(unsigned long long), stream);
+        tc_block_kernel<TPB><<<(n + TPB - 1) / TPB, TPB, 0, stream>>>(
+            G, vertex_triangles_count, P->heavy.data().get(), heavy_n, (long long)tc_heavy());
+        error::throw_if_exception(cudaGetLastError(), "tc block kernel");
+        int sms = 0;
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+        tc_heavy_kernel<<<sms * 16, 256, 0, stream>>>(G, vertex_triangles_count, P->heavy.data().get(),
+                                                       heavy_n);
+        error::throw_if_exception(cudaGetLastError(), "tc heavy kernel");
+      } else if (tc_block_mapped()) {
         operators::advance::execute<operators::load_balance_t::block_mapped,
                                     operators::advance_direction_t::forward,
                                     operators::advance_io_type_t::graph,
