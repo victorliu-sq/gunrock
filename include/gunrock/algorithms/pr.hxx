@@ -13,8 +13,50 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
 
+#include <cstdlib>
+#include <string>
+
 namespace gunrock {
 namespace pr {
+
+// GACGE (2026-10-14): PageRank as Ligra's (apps/PageRank.C): pull, float, no
+// redistribution of dangling (degree-0) mass, contrib[u] = alpha * p[u] / deg(u)
+// once per iteration, p[v] = (1 - alpha) / n + sum of contrib over v's
+// neighbors (one warp per vertex, so a high-degree vertex's sum is split over
+// 32 lanes). Used with a fixed iteration count (max_iters > 0, GACGE_PR_ITERS);
+// GACGE_PR=push, or no fixed count, runs Gunrock's push PageRank (atomicAdd per
+// edge, dangling mass redistributed).
+inline bool pr_pull() {
+  static const bool pull = [] {
+    const char* e = std::getenv("GACGE_PR");
+    return e == nullptr || std::string(e) != "push";
+  }();
+  return pull;
+}
+
+template <typename graph_t, typename weight_t>
+__global__ void pull_warp_kernel(graph_t G,
+                                 const weight_t* __restrict__ contrib,
+                                 weight_t* __restrict__ p,
+                                 std::size_t n,
+                                 weight_t base) {
+  using vertex_t = typename graph_t::vertex_type;
+  using edge_t = typename graph_t::edge_type;
+  const std::size_t warp =
+      (blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  if (warp >= n)
+    return;  // the whole warp: n is compared per warp
+  const vertex_t v = static_cast<vertex_t>(warp);
+  const edge_t begin = G.get_starting_edge(v), end = G.get_starting_edge(v + 1);
+  weight_t sum = 0;
+  for (edge_t e = begin + lane; e < end; e += 32)
+    sum += contrib[G.get_destination_vertex(e)];
+  for (int offset = 16; offset > 0; offset >>= 1)
+    sum += __shfl_down_sync(0xffffffffu, sum, offset);
+  if (lane == 0)
+    p[v] = base + sum;
+}
 
 template <typename weight_t>
 struct param_t {
@@ -86,6 +128,17 @@ struct problem_t : gunrock::problem_t<graph_t> {
 
       return val != 0 ? alpha / val : 0;
     };
+    // pull: alpha / deg (the graph's edge weights are 1; not read)
+    auto get_degree = [=] __host__ __device__(const int& i) -> weight_t {
+      auto d = g.get_number_of_neighbors(i);
+      return d != 0 ? alpha / weight_t(d) : 0;
+    };
+    if (pr_pull() && this->param.max_iters > 0) {
+      thrust::transform(policy, thrust::counting_iterator<vertex_t>(0),
+                        thrust::counting_iterator<vertex_t>(n_vertices),
+                        iweights.begin(), get_degree);
+      return;
+    }
 
     thrust::transform(policy, thrust::counting_iterator<vertex_t>(0),
                       thrust::counting_iterator<vertex_t>(n_vertices),
@@ -117,6 +170,21 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto alpha = P->param.alpha;
 
     auto policy = this->context->get_context(0)->execution_policy();
+
+    if (pr_pull() && P->param.max_iters > 0) {
+      // contrib (in plast) = alpha * p / deg, then p = (1 - alpha) / n + sum
+      thrust::transform(policy, p, p + n_vertices, iweights, plast,
+                        thrust::multiplies<weight_t>());
+      const std::size_t threads = 256;
+      const std::size_t blocks =
+          (static_cast<std::size_t>(n_vertices) * 32 + threads - 1) / threads;
+      pull_warp_kernel<<<blocks, threads, 0,
+                         this->context->get_context(0)->stream()>>>(
+          G, plast, p, static_cast<std::size_t>(n_vertices),
+          weight_t((1 - alpha) / n_vertices));
+      error::throw_if_exception(cudaGetLastError(), "pr pull kernel");
+      return;
+    }
 
     thrust::copy_n(policy, p, n_vertices, plast);
 
