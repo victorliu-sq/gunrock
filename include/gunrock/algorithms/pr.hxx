@@ -10,6 +10,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/algorithms/gacge_lb.hxx>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
 
@@ -25,14 +26,19 @@ namespace pr {
 // neighbors (one warp per vertex, so a high-degree vertex's sum is split over
 // 32 lanes). Used with a fixed iteration count (max_iters > 0, GACGE_PR_ITERS);
 // GACGE_PR=push, or no fixed count, runs Gunrock's push PageRank (atomicAdd per
-// edge, dangling mass redistributed).
-inline bool pr_pull() {
-  static const bool pull = [] {
+// edge, dangling mass redistributed). GACGE_PR=advance: the same pull as an
+// advance (GACGE_LB) over the edges of a frontier holding every vertex; a
+// vertex's edges may be split over threads, so each adds its neighbor's
+// contribution to the vertex's rank with atomicAdd.
+inline const std::string& pr_mode() {
+  static const std::string mode = [] {
     const char* e = std::getenv("GACGE_PR");
-    return e == nullptr || std::string(e) != "push";
+    return std::string(e ? e : "pull");
   }();
-  return pull;
+  return mode;
 }
+inline bool pr_pull() { return pr_mode() != "push"; }   // pull or advance
+inline bool pr_advance() { return pr_mode() == "advance"; }
 
 template <typename graph_t, typename weight_t>
 __global__ void pull_warp_kernel(graph_t G,
@@ -156,6 +162,15 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   using vertex_t = typename problem_t::vertex_t;
   using edge_t = typename problem_t::edge_t;
   using weight_t = typename problem_t::weight_t;
+  using frontier_t = typename enactor_t<problem_t>::frontier_t;
+
+  // GACGE_PR=advance: every vertex, once, before the timed loop
+  void prepare_frontier(frontier_t* f,
+                        gcuda::multi_context_t& context) override {
+    if (pr_advance())
+      f->sequence((vertex_t)0, this->get_problem()->get_graph().get_number_of_vertices(),
+                  context.get_context(0)->stream());
+  }
 
   void loop(gcuda::multi_context_t& context) override {
     // Data slice
@@ -175,6 +190,21 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       // contrib (in plast) = alpha * p / deg, then p = (1 - alpha) / n + sum
       thrust::transform(policy, p, p + n_vertices, iweights, plast,
                         thrust::multiplies<weight_t>());
+      if (pr_advance()) {
+        thrust::fill_n(policy, p, n_vertices, weight_t((1 - alpha) / n_vertices));
+        auto pull_edge = [p, plast] __host__ __device__(
+                             vertex_t const& v, vertex_t const& u,
+                             edge_t const& e, weight_t const& w) -> bool {
+          math::atomic::add(p + v, plast[u]);
+          return false;
+        };
+        gacge::advance<operators::advance_direction_t::forward,
+                       operators::advance_io_type_t::vertices,
+                       operators::advance_io_type_t::none>(
+            G, pull_edge, E->get_input_frontier(), E->get_output_frontier(),
+            E->scanned_work_domain, context);
+        return;
+      }
       const std::size_t threads = 256;
       const std::size_t blocks =
           (static_cast<std::size_t>(n_vertices) * 32 + threads - 1) / threads;

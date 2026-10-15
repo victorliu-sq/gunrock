@@ -10,6 +10,10 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/algorithms/gacge_lb.hxx>
+
+#include <cstdlib>
+#include <string>
 
 namespace gunrock {
 namespace bfs {
@@ -82,6 +86,16 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     f->push_back(P->param.single_source);
   }
 
+  // GACGE_BFS_PULL=advance: pull steps as an advance (see pull_step); default:
+  // one thread per vertex (parallel_for), which stops at the first parent.
+  static bool pull_with_advance() {
+    static const bool v = [] {
+      const char* e = std::getenv("GACGE_BFS_PULL");
+      return e != nullptr && std::string(e) == "advance";
+    }();
+    return v;
+  }
+
   // Direction-optimized BFS: decides the step's direction by Ligra's rule and,
   // for a pull step, runs it and makes the next frontier; false: push.
   bool pull_step(gcuda::multi_context_t& context) {
@@ -107,6 +121,43 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       return false;
     const vertex_t level = this->iteration;
     const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
+    const vertex_t n = G.get_number_of_vertices();
+    if (pull_with_advance()) {
+      // GACGE_BFS_PULL=advance: the unvisited vertices are the input of an
+      // advance (GACGE_LB) over their edges; an edge (v, u) with u in the level
+      // sets v. A vertex's remaining edges are still read once v is set (the
+      // operator returns at once), unlike the scan below, which stops.
+      auto* scratch = this->get_output_frontier();
+      scratch->reserve(n);
+      vertex_t* s = scratch->data();
+      auto send = thrust::copy_if(policy, thrust::counting_iterator<vertex_t>(0),
+                                  thrust::counting_iterator<vertex_t>(n), s,
+                                  [distances, unvisited] __host__ __device__(vertex_t v) {
+                                    return distances[v] == unvisited;
+                                  });
+      scratch->set_number_of_elements(send - s);
+      auto pull_edge = [distances, level, unvisited] __host__ __device__(
+                           vertex_t const& v, vertex_t const& u, edge_t const& e,
+                           weight_t const& w) -> bool {
+        if (distances[v] == unvisited && distances[u] == level)
+          distances[v] = level + 1;  // every writer stores the same value
+        return false;
+      };
+      gacge::advance<operators::advance_direction_t::forward,
+                     operators::advance_io_type_t::vertices,
+                     operators::advance_io_type_t::none>(
+          G, pull_edge, scratch, in, this->get_enactor()->scanned_work_domain, context);
+      // the next frontier, in the input buffer (no swap)
+      in->reserve(n);
+      vertex_t* o = in->data();
+      auto end = thrust::copy_if(policy, thrust::counting_iterator<vertex_t>(0),
+                                 thrust::counting_iterator<vertex_t>(n), o,
+                                 [distances, level] __host__ __device__(vertex_t v) {
+                                   return distances[v] == level + 1;
+                                 });
+      in->set_number_of_elements(end - o);
+      return true;
+    }
     auto pull = [G, distances, level, unvisited] __host__ __device__(vertex_t const& v) {
       if (distances[v] != unvisited)
         return;
@@ -119,7 +170,6 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
     operators::parallel_for::execute<operators::parallel_for_each_t::vertex>(G, pull, context);
     // the next frontier: the vertices this step reached
-    const vertex_t n = G.get_number_of_vertices();
     auto* out = this->get_output_frontier();
     out->reserve(n);
     vertex_t* o = out->data();
@@ -181,8 +231,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     };
 
     // Execute advance operator on the provided lambda
-    operators::advance::execute<operators::load_balance_t::block_mapped>(
-        G, E, search, context);
+    gacge::advance(G, E, search, context);  // GACGE_LB
 
     // Execute filter operator to remove the invalids.
     // @todo: Add CLI option to enable or disable this.
