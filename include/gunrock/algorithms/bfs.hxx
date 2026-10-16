@@ -110,10 +110,10 @@ struct bu_items_t {
 template <int Gs, typename graph_t, typename vertex_t>
 __global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, vertex_t level,
                                                     gacge::lb::frontier_tiles_t<graph_t> items, long long n,
-                                                    const unsigned long long* offsets, int grain, vertex_t* next,
+                                                    gacge::lb::merge_args_t m, vertex_t* next,
                                                     unsigned long long* counters) {
   unsigned long long scout = 0;
-  gacge::lb::for_edges<Gs>(items, n, offsets, grain, [&](long long, vertex_t, long long e) {
+  gacge::lb::for_edges<Gs>(items, n, m, [&](long long, vertex_t, long long e) {
     const vertex_t v = G.get_destination_vertex(e);
     if (claim(dist, v, level)) {
       push_back(next, counters + 0, v);
@@ -126,12 +126,12 @@ __global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, v
 
 template <int Gs, typename graph_t, typename vertex_t>
 __global__ void __launch_bounds__(kBlock) bu_kernel(graph_t G, vertex_t* dist, vertex_t level, bu_items_t<graph_t> items,
-                                                    long long n, const unsigned long long* offsets, int grain,
+                                                    long long n, gacge::lb::merge_args_t m,
                                                     const uint32_t* front, uint32_t* next,
                                                     unsigned long long* counters) {
   const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
   unsigned long long awake = 0;
-  gacge::lb::for_edges<Gs>(items, n, offsets, grain, [&](long long, vertex_t u, long long e) {
+  gacge::lb::for_edges<Gs>(items, n, m, [&](long long, vertex_t u, long long e) {
     if (dist[u] != unvisited)  // found: GAP's break
       return true;
     if (get_bit(front, G.get_destination_vertex(e))) {
@@ -207,7 +207,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   bool gap_dobfs() const { return param.direction_optimized && rule_gap(); }
   vertex_t* queue[2] = {nullptr, nullptr};
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
-  gacge::lb::offsets_t offsets;  // merge: a step's prefix sum of edges
+  gacge::lb::merge_t merge;  // merge-path: a step's prefix sum of edges and its merge tiles
   int cur = 0;
   unsigned long long queue_n = 0;
   uint32_t* front = nullptr;
@@ -237,8 +237,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
       cudaMallocAsync(reinterpret_cast<void**>(&q), std::max<std::size_t>(n, 1) * sizeof(vertex_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&front), words * sizeof(uint32_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&curr), words * sizeof(uint32_t), stream());
-    if (lb == gacge::lb::mode_t::merge)
-      offsets.reserve(n);
+    if (lb == gacge::lb::mode_t::merge) {
+      merge.reserve(n);
+      merge.reserve_work((long long)n + this->get_graph().get_number_of_edges());
+    }
     cudaMallocAsync(reinterpret_cast<void**>(&d_counters), 3 * sizeof(unsigned long long), stream());
     cudaMallocHost(reinterpret_cast<void**>(&h_counters), 3 * sizeof(unsigned long long));
   }
@@ -336,10 +338,15 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         const long long nn = n;
         gacge::lb::dispatch(P->lb, [&](auto tag) {
           constexpr int Gs = decltype(tag)::value;
-          if constexpr (Gs == 0)
-            gacge::lb::prefix(items, nn, P->offsets.data, stream);
-          gap::bu_kernel<Gs><<<gacge::lb::grid<Gs>(nn), gap::kBlock, 0, stream>>>(
-              G, dist, P->level, items, nn, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain(), P->front, P->curr,
+          gacge::lb::merge_args_t m;
+          unsigned int g = gacge::lb::grid(nn);
+          if constexpr (Gs == 0) {
+            P->merge.prefix(items, nn, stream);
+            m = P->merge.plan(P->merge.offsets, nn, stream);
+            g = (unsigned int)std::max<long long>(1, P->merge.tiles);
+          }
+          gap::bu_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(
+              G, dist, P->level, items, nn, m, P->front, P->curr,
               P->d_counters);
         });
       }
@@ -368,10 +375,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       vertex_t* next = P->queue[P->cur ^ 1];
       gacge::lb::dispatch(P->lb, [&](auto tag) {
         constexpr int Gs = decltype(tag)::value;
-        if constexpr (Gs == 0)
-          gacge::lb::prefix(items, nq, P->offsets.data, stream);
-        gap::td_kernel<Gs><<<gacge::lb::grid<Gs>(nq), gap::kBlock, 0, stream>>>(
-            G, dist, P->level, items, nq, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain(), next, P->d_counters);
+        gacge::lb::merge_args_t m;
+        unsigned int g = gacge::lb::grid(nq);
+        if constexpr (Gs == 0) {
+          P->merge.prefix(items, nq, stream);
+          m = P->merge.plan(P->merge.offsets, nq, stream);
+          g = (unsigned int)std::max<long long>(1, P->merge.tiles);
+        }
+        gap::td_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(G, dist, P->level, items, nq, m, next, P->d_counters);
       });
     }
     P->read_counters();

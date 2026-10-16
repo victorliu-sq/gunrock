@@ -20,6 +20,7 @@
 #include <cub/block/block_scan.cuh>
 
 #include <cstdlib>
+#include <memory>
 #include <string>
 
 namespace gunrock {
@@ -164,19 +165,31 @@ struct all_items_t {
 // first). The row offsets are the merge path's prefix sum.
 template <int Gs, typename graph_t, typename weight_t>
 __global__ void __launch_bounds__(gacge::lb::kBlock)
-    pr_sum_kernel(graph_t G, const weight_t* __restrict__ contrib, weight_t* __restrict__ sums, int grain) {
+    pr_sum_kernel(graph_t G, const weight_t* __restrict__ contrib, weight_t* __restrict__ sums,
+                  gacge::lb::merge_args_t m) {
   using vertex_t = typename graph_t::vertex_type;
   constexpr int kBlock = gacge::lb::kBlock;
   const vertex_t n = G.get_number_of_vertices();
   all_items_t<graph_t> items{G};
-  if constexpr (Gs == 1) {
+  if constexpr (Gs == 1) {  // a thread owns its vertex: its sum is stored
+    long long cur = -1;
+    weight_t acc = 0;
+    gacge::lb::thread_mapped(items, n, [&](long long i, vertex_t, long long e) {
+      if (i != cur) {
+        if (cur >= 0)
+          sums[cur] = acc;
+        cur = i;
+        acc = 0;
+      }
+      acc += contrib[G.get_destination_vertex(e)];
+      return false;
+    });
+    if (cur >= 0)
+      sums[cur] = acc;
+    // a vertex without edges: 0
     const long long v = (long long)blockIdx.x * kBlock + threadIdx.x;
-    if (v < n) {
-      weight_t acc = 0;
-      for (auto e = G.get_starting_edge(v), last = G.get_starting_edge(v + 1); e < last; ++e)
-        acc += contrib[G.get_destination_vertex(e)];
-      sums[v] = acc;
-    }
+    if (v < n && G.get_number_of_neighbors((vertex_t)v) == 0)
+      sums[v] = 0;
   } else if constexpr (Gs > 1) {
     __shared__ weight_t s_sum[kBlock];
     const long long first = (long long)blockIdx.x * kBlock;
@@ -194,21 +207,25 @@ __global__ void __launch_bounds__(gacge::lb::kBlock)
     });
     if (first + threadIdx.x < n)
       sums[first + threadIdx.x] = s_sum[threadIdx.x];
-  } else {
-    vertex_t cur = gunrock::numeric_limits<vertex_t>::invalid();
+  } else {  // a thread adds its run of a vertex's edges when the vertex changes (sums zeroed first)
+    long long cur = -1;
     weight_t acc = 0;
-    gacge::lb::merge_path(items, n, G.get_row_offsets(), grain, [&](long long, vertex_t v, long long e) {
-      if (v != cur) {
-        if (gunrock::util::limits::is_valid(cur))
-          atomicAdd(sums + cur, acc);
-        cur = v;
-        acc = 0;
-      }
-      acc += contrib[G.get_destination_vertex(e)];
-      return false;
-    });
-    if (gunrock::util::limits::is_valid(cur))
-      atomicAdd(sums + cur, acc);
+    gacge::lb::merge_path(
+        items, n, m,
+        [&](long long i, vertex_t, long long e) {
+          if (i != cur) {
+            if (cur >= 0)
+              atomicAdd(sums + cur, acc);
+            cur = i;
+            acc = 0;
+          }
+          acc += contrib[G.get_destination_vertex(e)];
+          return false;
+        },
+        [&]() {
+          if (cur >= 0)
+            atomicAdd(sums + cur, acc);
+        });
   }
 }
 
@@ -253,6 +270,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   thrust::device_vector<weight_t> sums;  // nr, gacge: the neighbors' sums of an iteration
   thrust::device_vector<float> error;    // nr, gacge: GAP's error of an iteration
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);  // gacge
+  gacge::lb::merge_t merge;           // gacge, merge-path: the merge tiles over the row offsets (once per run,
+  gacge::lb::merge_args_t merge_args;  // outside the timing)
 
   void init() override {
     auto g = this->get_graph();
@@ -262,6 +281,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
     if (pr_nr() || pr_gacge()) {
       sums.resize(n_vertices);
       error.resize(1);
+    }
+    if (pr_gacge() && lb == gacge::lb::mode_t::merge) {
+      merge.reserve_work((long long)n_vertices + g.get_number_of_edges());
+      merge_args = merge.plan(g.get_row_offsets(), (long long)n_vertices, this->context->get_context(0)->stream());
     }
 
   }
@@ -392,10 +415,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         const unsigned int blocks = (unsigned int)(((long long)n_vertices + 255) / 256);
         gacge::lb::dispatch(P->lb, [&](auto tag) {
           constexpr int Gs = decltype(tag)::value;
-          if constexpr (Gs == 0)
+          if constexpr (Gs == 0) {
             cudaMemsetAsync(sums, 0, n_vertices * sizeof(weight_t), stream);
-          pr_sum_kernel<Gs><<<gacge::lb::grid<Gs>(n_vertices), gacge::lb::kBlock, 0, stream>>>(G, plast, sums,
-                                                                                            gacge::lb::grain());
+            pr_sum_kernel<0><<<(unsigned int)P->merge.tiles, gacge::lb::kBlock, 0, stream>>>(G, plast, sums,
+                                                                                          P->merge_args);
+          } else {
+            pr_sum_kernel<Gs><<<gacge::lb::grid(n_vertices), gacge::lb::kBlock, 0, stream>>>(
+                G, plast, sums, gacge::lb::merge_args_t{});
+          }
         });
         cudaMemsetAsync(error, 0, sizeof(float), stream);
         pr_finish_kernel<<<blocks, 256, 0, stream>>>(sums, p, (std::size_t)n_vertices, base, error);

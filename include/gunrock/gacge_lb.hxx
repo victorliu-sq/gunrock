@@ -4,21 +4,18 @@
  * primitives (BFS, SSSP, PageRank, TC, X-Blossom), whose algorithms follow
  * their CPU counterparts (GAP, XB-GAP) step for step. A step's work is a list
  * of tiles (a frontier's vertices, or every vertex), tile i being vertex u with
- * len(i) atoms (edges) from start(i). The schedules are those of Osama,
- * Porumbescu and Owens, "A Programming Model for GPU Load Balancing" (PPoPP
- * 2023; the gunrock/loops library):
+ * len(i) atoms (edges) from start(i). The schedules are gunrock/loops' (Osama,
+ * Porumbescu and Owens, "A Programming Model for GPU Load Balancing", PPoPP
+ * 2023; src/loops), with loops' launch box for sm_89 (128 threads a block):
  *
- *   thread  thread-mapped: one thread per tile walks its atoms;
- *   warp    group-mapped with groups of 32 (warp-mapped),
- *   group   group-mapped with groups of GACGE_LB_GROUP (64 or 128, default 64),
- *   block   group-mapped with groups of 256 (block-mapped): a group takes as
- *           many tiles as threads, scans their lengths in shared memory, and
- *           its threads share the atoms, an atom's tile found by a binary
- *           search in the scan;
- *   merge   merge-path (Merrill and Garland, as CUB's SpMV): tiles plus atoms
- *           are the work, cut evenly into chunks of GACGE_LB_GRAIN units
- *           (default 8); a thread finds its chunk's start by a binary search on
- *           the merge-path diagonal over the tiles' prefix sum and walks it.
+ *   thread  thread-mapped (loops::schedule thread_mapped): a thread per tile;
+ *   warp    group-mapped with groups of 32 (loops' warp_mapped),
+ *   block   group-mapped with groups of 128 (loops' block_mapped): a group
+ *           takes as many tiles as threads, scans their sizes, and its
+ *           threads share the atoms;
+ *   merge   merge-path (loops' merge_path_flat): tiles plus atoms cut evenly,
+ *           7 units a thread, a block per merge tile; the merge tiles'
+ *           coordinates from loops' generate_search_coordinates.
  *
  * GACGE_LB picks one for every primitive (each has its default). f(i, u, e)
  * handles atom e of tile i (vertex u); true skips the rest of tile i's atoms
@@ -26,6 +23,8 @@
  * neighbor in the front.
  */
 #pragma once
+
+#include <loops/schedule.hxx>
 
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
@@ -41,7 +40,9 @@ namespace gacge {
 namespace lb {
 
 enum class mode_t { thread, warp, group, block, merge };
-constexpr int kBlock = 256;
+constexpr int kBlock = 128;           // loops' launch box (sm_89)
+constexpr std::size_t kItems = 7;     // merge-path: units a thread (loops' launch box, 4-byte values)
+constexpr long long kMergeTile = kBlock * (long long)kItems;
 
 // a schedule at compile time: 1 thread-mapped, 0 merge-path, else the group size
 template <int G>
@@ -53,19 +54,11 @@ inline bool& enabled() {
   return v;
 }
 
-inline int group_size() {
-  static const int v = [] {
-    const char* e = std::getenv("GACGE_LB_GROUP");
-    return (e && std::atoi(e) == 128) ? 128 : 64;
-  }();
-  return v;
-}
-
 inline const char* name(mode_t m) {
   switch (m) {
     case mode_t::thread: return "thread";
     case mode_t::warp: return "warp";
-    case mode_t::group: return group_size() == 128 ? "group128" : "group64";
+    case mode_t::group: return "group64";
     case mode_t::block: return "block";
     default: return "merge";
   }
@@ -83,69 +76,100 @@ inline mode_t mode(mode_t def) {
   return mode_t::block;
 }
 
-inline int grain() {
-  static const int v = [] {
-    const char* e = std::getenv("GACGE_LB_GRAIN");
-    return e ? std::max(1, std::atoi(e)) : 8;
-  }();
-  return v;
-}
-
-// merge: a persistent grid of 8 blocks per SM
-inline unsigned int merge_grid() {
-  static const unsigned int v = [] {
-    int sms = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-    return (unsigned int)(sms * 8);
-  }();
-  return v;
-}
-
-// the grid of a step over n tiles (a block holds kBlock tiles, except merge)
-template <int G>
-inline unsigned int grid(long long n) {
-  if (G == 0)
-    return merge_grid();
-  return (unsigned int)std::max<long long>(1, (n + kBlock - 1) / kBlock);
-}
-
 // f(tag_t<G>{}) for the schedule m
 template <typename func_t>
 void dispatch(mode_t m, func_t&& f) {
   switch (m) {
     case mode_t::thread: f(tag_t<1>{}); break;
     case mode_t::warp: f(tag_t<32>{}); break;
-    case mode_t::group:
-      if (group_size() == 128)
-        f(tag_t<128>{});
-      else
-        f(tag_t<64>{});
-      break;
-    case mode_t::block: f(tag_t<256>{}); break;
+    case mode_t::group: f(tag_t<64>{}); break;
+    case mode_t::block: f(tag_t<kBlock>{}); break;
     default: f(tag_t<0>{}); break;
   }
+}
+
+// the grid of the thread- and group-mapped schedules over n tiles (merge-path: merge_t::tiles)
+inline unsigned int grid(long long n) {
+  return (unsigned int)std::max<long long>(1, (n + kBlock - 1) / kBlock);
 }
 
 // tiles_t: __device__ void item(long long i, vertex_t& u, long long& start) const;
 //          __device__ long long len(long long i) const;
 
+// a loops layout over tiles_t: tile t's atoms are its edges [start, start + len)
+template <typename tiles_t>
+struct edge_layout_t {
+  using tile_id_t = int;
+  using atom_id_t = int;
+  using tile_end_iterator_t = const int*;
+  tiles_t it;
+  int n;
+  __host__ __device__ int num_tiles() const { return n; }
+  __host__ __device__ int num_atoms() const { return 0; }
+  __device__ int tile_size(int t) const { return (int)it.len(t); }
+  __device__ int tile_begin(int t) const {
+    typename tiles_t::vertex_type u;
+    long long start;
+    it.item(t, u, start);
+    return (int)start;
+  }
+  __device__ int tile_end(int t) const { return tile_begin(t) + tile_size(t); }
+};
+
+// thread-mapped: loops' setup<thread_mapped>
 template <typename tiles_t, typename func_t>
 __device__ __forceinline__ void thread_mapped(const tiles_t& it, long long n, func_t f) {
-  const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= n)
-    return;
-  typename tiles_t::vertex_type u;
-  long long start;
-  it.item(i, u, start);
-  const long long last = start + it.len(i);
-  for (long long e = start; e < last; ++e)
-    if (f(i, u, e))
-      break;
+  using layout_t = edge_layout_t<tiles_t>;
+  using setup_t =
+      loops::schedule::setup<loops::schedule::algorithms_t::thread_mapped, 1, 1, int, int, int, int, layout_t>;
+  setup_t config(layout_t{it, (int)n});
+  for (auto tile : config.tiles()) {
+    typename tiles_t::vertex_type u;
+    long long start;
+    it.item(tile, u, start);
+    for (auto e : config.atoms(tile))
+      if (f((long long)tile, u, (long long)e))
+        break;
+  }
 }
 
-// Group-mapped over tiles [first, first + k), k <= kBlock: the block's
-// kBlock / G groups each take G consecutive tiles. Every thread of the block
-// calls it (it synchronizes the block).
+// group-mapped (groups of G, a block of kBlock): loops' setup<group_mapped>
+template <int G, typename tiles_t, typename func_t>
+__device__ __forceinline__ void group_mapped(const tiles_t& it, long long n, func_t f) {
+  using layout_t = edge_layout_t<tiles_t>;
+  using setup_t =
+      loops::schedule::setup<loops::schedule::algorithms_t::group_mapped, kBlock, G, int, int, int, int, layout_t>;
+  using vertex_t = typename tiles_t::vertex_type;
+  __shared__ typename setup_t::storage_t temporary_storage;
+  __shared__ vertex_t s_u[kBlock];  // the block's tiles' vertices, by slot
+  __shared__ int s_stop[kBlock];
+  const long long first = (long long)blockIdx.x * kBlock;
+  if (first + threadIdx.x < n) {
+    long long start;
+    it.item(first + threadIdx.x, s_u[threadIdx.x], start);
+  }
+  s_stop[threadIdx.x] = 0;
+  __syncthreads();
+  setup_t config(temporary_storage, layout_t{it, (int)n});
+  auto p = config.partition();
+  for (auto virtual_atom : config.atom_accessor(p)) {
+    auto virtual_tile = config.tile_accessor(virtual_atom, p);
+    if (!config.is_valid_accessor(virtual_tile, p))
+      continue;
+    const int slot = (int)virtual_tile + (int)(p.meta_group_rank() * p.size());
+    if (s_stop[slot])
+      continue;
+    auto tile = config.tile_id(virtual_tile, p);
+    auto e = config.atom_id(virtual_atom, tile, virtual_tile, p);
+    if (f((long long)tile, s_u[slot], (long long)e))
+      s_stop[slot] = 1;
+  }
+  __syncthreads();
+}
+
+// Group-mapped over tiles [first, first + k), k <= kBlock, inside one block
+// (SSSP's bin fusion rounds, a block's own vertices): the block's kBlock / G
+// groups each take G consecutive tiles. Every thread of the block calls it.
 template <int G, typename tiles_t, typename func_t>
 __device__ __forceinline__ void group_tiles(const tiles_t& it, long long first, int k, func_t f) {
   static_assert(G >= 2 && G <= kBlock && (kBlock % G) == 0, "group size");
@@ -196,101 +220,134 @@ __device__ __forceinline__ void group_tiles(const tiles_t& it, long long first, 
   __syncthreads();
 }
 
-template <int G, typename tiles_t, typename func_t>
-__device__ __forceinline__ void group_mapped(const tiles_t& it, long long n, func_t f) {
-  const long long first = (long long)blockIdx.x * kBlock;
-  group_tiles<G>(it, first, (int)min((long long)kBlock, n - first), f);
-}
+// merge-path: loops' setup<merge_path_flat> over a CSR layout of the tiles'
+// prefix sum (offsets[0..n], int), its merge tiles' coordinates in meta
+using coord_t = loops::schedule::coord_t;
+using meta_t = loops::schedule::merge_path::preprocess_t<kBlock, kItems, int, int, std::size_t, std::size_t>;
+using merge_setup_t = loops::schedule::setup<loops::schedule::algorithms_t::merge_path_flat, kBlock, kItems, int, int,
+                                             std::size_t, std::size_t>;
 
-// Merge-path: unit d < n + total is a tile end (x advances) or an atom (y
-// advances); offsets[0..n] is the tiles' exclusive prefix sum.
-template <typename offset_t>
-__device__ __forceinline__ void merge_path_search(long long d, const offset_t* offsets, long long n, long long total,
-                                                  long long& x, long long& y) {
-  long long x_min = max(d - total, 0LL), x_max = min(d, n);
-  while (x_min < x_max) {
-    const long long pivot = (x_min + x_max) >> 1;
-    if ((long long)offsets[pivot + 1] <= d - pivot - 1)
-      x_min = pivot + 1;
-    else
-      x_max = pivot;
-  }
-  x = min(x_min, n);
-  y = d - x;
-}
+struct merge_args_t {
+  const int* offsets = nullptr;
+  meta_t* meta = nullptr;
+};
 
-template <typename tiles_t, typename offset_t, typename func_t>
-__device__ __forceinline__ void merge_path(const tiles_t& it, long long n, const offset_t* offsets, int grain,
-                                           func_t f) {
-  const long long total = (long long)offsets[n];
-  const long long work = n + total;
-  const long long chunks = (work + grain - 1) / grain;
-  const long long stride = (long long)gridDim.x * blockDim.x;
-  for (long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x; c < chunks; c += stride) {
-    const long long d0 = c * grain, d1 = min(d0 + grain, work);
-    long long x, y;
-    merge_path_search(d0, offsets, n, total, x, y);
-    typename tiles_t::vertex_type u{};
-    long long start = 0, cached = -1;
-    bool stopped = false;
-    for (long long d = d0; d < d1; ++d) {
-      if (x < n && y < (long long)offsets[x + 1]) {  // an atom of tile x
-        if (!stopped) {
-          if (cached != x) {
-            it.item(x, u, start);
-            cached = x;
-          }
-          stopped = f(x, u, start + (y - (long long)offsets[x]));
-        }
-        ++y;
-      } else {  // tile x ends
-        ++x;
+struct no_done_t {
+  __device__ void operator()() const {}
+};
+
+// f(i, u, e) for this thread's atoms; done() by every thread of a merge tile
+// after them (converged: e.g. a warp reduction of a thread's partial)
+template <typename tiles_t, typename func_t, typename done_t = no_done_t>
+__device__ __forceinline__ void merge_path(const tiles_t& it, long long n, merge_args_t m, func_t f,
+                                           done_t done = done_t{}) {
+  __shared__ typename merge_setup_t::storage_t temporary_storage;
+  const std::size_t nnz = (std::size_t)m.offsets[n];
+  merge_setup_t config(*m.meta, temporary_storage, const_cast<int*>(m.offsets), (std::size_t)n, nnz);
+  auto map = config.init();
+  if (!config.is_valid_accessor(map))
+    return;
+  long long cur = -1, row_begin = 0, start = 0;
+  typename tiles_t::vertex_type u{};
+  bool stopped = false;
+#pragma unroll
+  for (auto item : config.virtual_idx()) {
+    auto nz = config.atom_idx(item, map);
+    auto row = config.tile_idx(map);
+    if (config.atoms_counting_it[map.y] < temporary_storage.tile_end_offset[map.x]) {
+      if (row != cur) {
+        it.item(row, u, start);
+        row_begin = m.offsets[row];
+        cur = row;
         stopped = false;
       }
+      if (!stopped)
+        stopped = f((long long)row, u, start + ((long long)nz - row_begin));
+      map.y++;
+    } else {
+      map.x++;
     }
   }
+  done();
 }
 
-// the schedule G over n tiles (offsets and grain for merge-path)
-template <int G, typename tiles_t, typename offset_t, typename func_t>
-__device__ __forceinline__ void for_edges(const tiles_t& it, long long n, const offset_t* offsets, int grain,
-                                          func_t f) {
+// the schedule G over n tiles (merge-path: m)
+template <int G, typename tiles_t, typename func_t>
+__device__ __forceinline__ void for_edges(const tiles_t& it, long long n, merge_args_t m, func_t f) {
   if constexpr (G == 1)
     thread_mapped(it, n, f);
   else if constexpr (G == 0)
-    merge_path(it, n, offsets, grain, f);
+    merge_path(it, n, m, f);
   else
     group_mapped<G>(it, n, f);
 }
 
-// merge: offsets[0..n] of the tiles' lengths, on stream
-template <typename tiles_t>
-void prefix(const tiles_t& it, long long n, unsigned long long* offsets, cudaStream_t stream) {
-  thrust::transform_exclusive_scan(
-      thrust::cuda::par_nosync.on(stream), thrust::counting_iterator<long long>(0),
-      thrust::counting_iterator<long long>(n + 1), offsets,
-      [it, n] __device__(long long i) -> unsigned long long { return i < n ? (unsigned long long)it.len(i) : 0ULL; },
-      0ULL, thrust::plus<unsigned long long>());
-}
-
-// a growable device buffer of offsets (merge), sized outside the timing
-struct offsets_t {
-  unsigned long long* data = nullptr;
+// the merge-path side of a primitive: the tiles' prefix sum, the merge tiles'
+// coordinates (loops' generate_search_coordinates) and a meta whose data()
+// they are, in device memory; buffers sized outside the timing
+struct merge_t {
+  int* offsets = nullptr;
   long long cap = 0;  // tiles
-  offsets_t() = default;
-  offsets_t(const offsets_t&) = delete;
-  offsets_t& operator=(const offsets_t&) = delete;
-  ~offsets_t() {
-    if (data)
-      cudaFree(data);
+  coord_t* coords = nullptr;
+  long long coords_cap = 0;  // merge tiles + 1
+  meta_t* d_meta = nullptr;
+  long long tiles = 0;  // the last plan's merge tiles: the grid
+  merge_t() = default;
+  merge_t(const merge_t&) = delete;
+  merge_t& operator=(const merge_t&) = delete;
+  ~merge_t() {
+    if (offsets) cudaFree(offsets);
+    if (coords) cudaFree(coords);
+    if (d_meta) cudaFree(d_meta);
   }
   void reserve(long long n) {
     if (n <= cap)
       return;
-    if (data)
-      cudaFree(data);
+    if (offsets)
+      cudaFree(offsets);
     cap = std::max<long long>(n, 2 * cap);
-    cudaMalloc(&data, (cap + 1) * sizeof(unsigned long long));
+    cudaMalloc(&offsets, (cap + 1) * sizeof(int));
+  }
+  // room for the merge tiles of up to `work` units (tiles + atoms)
+  void reserve_work(long long work) {
+    const long long need = work / kMergeTile + 2;
+    if (need <= coords_cap)
+      return;
+    if (coords)
+      cudaFree(coords);
+    coords_cap = std::max<long long>(need, 2 * coords_cap);
+    cudaMalloc(&coords, coords_cap * sizeof(coord_t));
+    if (!d_meta)
+      cudaMalloc(&d_meta, sizeof(meta_t));
+    // preprocess_t's data(): its total work, merge tiles, then the coordinates' pointer
+    struct {
+      std::size_t total_work, num_merge_tiles;
+      coord_t* coordinates;
+    } head{0, 0, coords};
+    static_assert(sizeof(head) <= sizeof(meta_t), "loops' preprocess_t layout");
+    cudaMemcpy(d_meta, &head, sizeof(head), cudaMemcpyHostToDevice);
+  }
+  // offsets[0..n] of the tiles' lengths, on stream
+  template <typename tiles_t>
+  void prefix(const tiles_t& it, long long n, cudaStream_t stream) {
+    thrust::transform_exclusive_scan(
+        thrust::cuda::par_nosync.on(stream), thrust::counting_iterator<long long>(0),
+        thrust::counting_iterator<long long>(n + 1), offsets,
+        [it, n] __device__(long long i) -> int { return i < n ? (int)it.len(i) : 0; }, 0, thrust::plus<int>());
+  }
+  // the merge tiles over offs[0..n] (this prefix sum, or a static one such as
+  // the row offsets), on stream: sets tiles (the grid) and their coordinates
+  merge_args_t plan(const int* offs, long long n, cudaStream_t stream) {
+    int nnz = 0;
+    cudaMemcpyAsync(&nnz, offs + n, sizeof(int), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    tiles = (n + nnz + kMergeTile - 1) / kMergeTile;
+    reserve_work(n + nnz);
+    using layout_t = loops::layout::csr<int, int>;
+    loops::schedule::merge_path::generate_search_coordinates<kBlock, kItems, layout_t, std::size_t, std::size_t>
+        <<<(unsigned int)((tiles + 1 + kBlock - 1) / kBlock), kBlock, 0, stream>>>(
+            layout_t(offs, (int)n, nnz), (std::size_t)n, (std::size_t)nnz, (std::size_t)tiles, coords);
+    return {offs, d_meta};
   }
 };
 
@@ -310,29 +367,32 @@ struct frontier_tiles_t {
 // the general advance: op(u, neighbor, edge, weight) over a frontier's edges
 template <int G, typename graph_t, typename op_t>
 __global__ void __launch_bounds__(kBlock)
-    advance_kernel(graph_t g, op_t op, frontier_tiles_t<graph_t> tiles, long long n, const unsigned long long* offsets,
-                   int grain) {
+    advance_kernel(graph_t g, op_t op, frontier_tiles_t<graph_t> tiles, long long n, merge_args_t m) {
   using vertex_t = typename graph_t::vertex_type;
   using edge_t = typename graph_t::edge_type;
-  for_edges<G>(tiles, n, offsets, grain, [&](long long, vertex_t u, long long e) {
+  for_edges<G>(tiles, n, m, [&](long long, vertex_t u, long long e) {
     op(u, g.get_destination_vertex((edge_t)e), (edge_t)e, g.get_edge_weight((edge_t)e));
     return false;
   });
 }
 
 template <typename graph_t, typename op_t>
-void advance(mode_t m, graph_t& g, op_t op, const typename graph_t::vertex_type* frontier, long long n,
-             offsets_t& offs, cudaStream_t stream) {
+void advance(mode_t md, graph_t& g, op_t op, const typename graph_t::vertex_type* frontier, long long n, merge_t& mg,
+             cudaStream_t stream) {
   if (n <= 0)
     return;
   frontier_tiles_t<graph_t> tiles{g, frontier};
-  dispatch(m, [&](auto tag) {
+  dispatch(md, [&](auto tag) {
     constexpr int G = decltype(tag)::value;
     if constexpr (G == 0) {
-      offs.reserve(n);
-      prefix(tiles, n, offs.data, stream);
+      mg.reserve(n);
+      mg.prefix(tiles, n, stream);
+      const merge_args_t m = mg.plan(mg.offsets, n, stream);
+      if (mg.tiles > 0)
+        advance_kernel<0><<<(unsigned int)mg.tiles, kBlock, 0, stream>>>(g, op, tiles, n, m);
+    } else {
+      advance_kernel<G><<<grid(n), kBlock, 0, stream>>>(g, op, tiles, n, merge_args_t{});
     }
-    advance_kernel<G><<<grid<G>(n), kBlock, 0, stream>>>(g, op, tiles, n, G == 0 ? offs.data : nullptr, grain());
   });
 }
 

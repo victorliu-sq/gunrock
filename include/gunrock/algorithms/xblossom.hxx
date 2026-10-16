@@ -133,8 +133,10 @@ class engine_t {
                                              cuda_stream_.cuda_stream()));
     scan_temp_.resize(bytes);
     scan_temp_bytes_ = bytes;
-    if (gacge::lb::enabled())
-      lb_offsets_.reserve(nnodes_);
+    if (gacge::lb::enabled()) {
+      lb_merge_.reserve(nnodes_);
+      lb_merge_.reserve_work((long long)nnodes_ + G.get_number_of_edges());
+    }
   }
 
   // entries of a blossom list: ratio x n, rounded up, plus the one a prefix sum needs
@@ -303,7 +305,7 @@ class engine_t {
 
   frontier_t input_frontier_;
   frontier_t output_frontier_;  // unused: the advances write no output frontier
-  gacge::lb::offsets_t lb_offsets_;  // -l gacge, merge-path's prefix sum (gacge_lb.hxx)
+  gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
 
   // GACGE_XB_PHASE_SYNC (default 1): a device synchronization at the end of
@@ -403,7 +405,7 @@ class engine_t {
     if (ts_on_) TraversalStep();
     if (gacge::lb::enabled()) {  // the schedule GACGE_LB of every GACGE primitive (gacge_lb.hxx)
       gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::block), G_, op, input_frontier_.data(),
-                         (long long)input_frontier_.get_number_of_elements(), lb_offsets_,
+                         (long long)input_frontier_.get_number_of_elements(), lb_merge_,
                          context_->get_context(0)->stream());
       CUDA_CHECK(cudaGetLastError());
       CUDA_CHECK(cudaDeviceSynchronize());

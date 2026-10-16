@@ -118,13 +118,13 @@ struct lower_tiles_t {
 // total (counters[0], GAP's reduction)
 template <int Gs, typename graph_t>
 __global__ void __launch_bounds__(kTcBlock)
-    tc_count_kernel(graph_t G, lower_tiles_t<graph_t> tiles, long long n, const unsigned long long* offsets, int grain,
+    tc_count_kernel(graph_t G, lower_tiles_t<graph_t> tiles, long long n, gacge::lb::merge_args_t m,
                     unsigned long long* counters) {
   using vertex_t = typename graph_t::vertex_type;
   using reduce_t = cub::BlockReduce<unsigned long long, kTcBlock>;
   __shared__ typename reduce_t::TempStorage temp;
   unsigned long long count = 0;
-  gacge::lb::for_edges<Gs>(tiles, n, offsets, grain, [&](long long, vertex_t u, long long e) {
+  gacge::lb::for_edges<Gs>(tiles, n, m, [&](long long, vertex_t u, long long e) {
     count += tc_merge(G, u, (vertex_t)G.get_destination_vertex(e));
     return false;
   });
@@ -208,13 +208,16 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // tc_gap: the total, the schedule, and merge-path's prefix sum of the edges below each vertex
   thrust::device_vector<unsigned long long> gap_counters;
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
-  gacge::lb::offsets_t offsets;
+  gacge::lb::merge_t merge;  // merge-path: the prefix sum of the edges below each vertex and its merge tiles (timed)
 
   void init() override {
     if (tc_gap() && param.oriented) {
       gap_counters.resize(1);
-      if (lb == gacge::lb::mode_t::merge)
-        offsets.reserve(this->get_graph().get_number_of_vertices());
+      if (lb == gacge::lb::mode_t::merge) {
+        merge.reserve(this->get_graph().get_number_of_vertices());
+        merge.reserve_work((long long)this->get_graph().get_number_of_vertices() +
+                           this->get_graph().get_number_of_edges());
+      }
     }
     if (tc_split()) {
       heavy.resize(this->get_graph().get_number_of_edges());
@@ -253,10 +256,16 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       lower_tiles_t<decltype(G)> tiles{G};
       gacge::lb::dispatch(P->lb, [&](auto tag) {
         constexpr int Gs = decltype(tag)::value;
-        if constexpr (Gs == 0)
-          gacge::lb::prefix(tiles, (long long)n, P->offsets.data, stream);
-        tc_count_kernel<Gs><<<gacge::lb::grid<Gs>(n), kTcBlock, 0, stream>>>(
-            G, tiles, (long long)n, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain(), counters);
+        if constexpr (Gs == 0) {
+          P->merge.prefix(tiles, (long long)n, stream);
+          const gacge::lb::merge_args_t m = P->merge.plan(P->merge.offsets, (long long)n, stream);
+          if (P->merge.tiles > 0)
+            tc_count_kernel<0><<<(unsigned int)P->merge.tiles, kTcBlock, 0, stream>>>(G, tiles, (long long)n, m,
+                                                                                    counters);
+        } else {
+          tc_count_kernel<Gs><<<gacge::lb::grid(n), kTcBlock, 0, stream>>>(G, tiles, (long long)n,
+                                                                         gacge::lb::merge_args_t{}, counters);
+        }
       });
       unsigned long long total = 0;  // GAP's OrderedCount returns the total
       cudaMemcpyAsync(&total, counters, sizeof(total), cudaMemcpyDeviceToHost, stream);

@@ -108,10 +108,11 @@ struct csr_tiles_t {
 // ids into its new list), the edges spread by the schedule GACGE_LB
 // (gacge_lb.hxx); merge-path's prefix sum is the row offsets
 template <int Gs, typename vertex_t, typename edge_t>
-__global__ void __launch_bounds__(256) relabel_map_kernel(const edge_t* off, const vertex_t* col, const edge_t* noff,
-                                                          const vertex_t* nid, vertex_t* mc, vertex_t n, int grain) {
+__global__ void __launch_bounds__(gacge::lb::kBlock) relabel_map_kernel(const edge_t* off, const vertex_t* col, const edge_t* noff,
+                                                          const vertex_t* nid, vertex_t* mc, vertex_t n,
+                                                          gacge::lb::merge_args_t m) {
   csr_tiles_t<vertex_t, edge_t> tiles{off};
-  gacge::lb::for_edges<Gs>(tiles, (long long)n, off, grain, [&](long long, vertex_t u, long long e) {
+  gacge::lb::for_edges<Gs>(tiles, (long long)n, m, [&](long long, vertex_t u, long long e) {
     mc[noff[nid[u]] + (e - off[u])] = nid[col[e]];
     return false;
   });
@@ -154,7 +155,15 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
   vertex_t* mc = thrust::raw_pointer_cast(mapped.data());
   gacge::lb::dispatch(gacge::lb::mode(gacge::lb::mode_t::block), [&](auto tag) {
     constexpr int Gs = decltype(tag)::value;
-    relabel_map_kernel<Gs><<<gacge::lb::grid<Gs>(n), 256>>>(off, col, noff, nid, mc, n, gacge::lb::grain());
+    if constexpr (Gs == 0) {  // merge-path over the row offsets (int: m < 2^31)
+      static gacge::lb::merge_t merge;  // its buffers (allocated in the first, warm-up, run)
+      const gacge::lb::merge_args_t args = merge.plan(reinterpret_cast<const int*>(off), (long long)n, 0);
+      if (merge.tiles > 0)
+        relabel_map_kernel<0><<<(unsigned int)merge.tiles, gacge::lb::kBlock>>>(off, col, noff, nid, mc, n, args);
+    } else {
+      relabel_map_kernel<Gs><<<gacge::lb::grid(n), gacge::lb::kBlock>>>(off, col, noff, nid, mc, n,
+                                                                       gacge::lb::merge_args_t{});
+    }
   });
   std::size_t temp_bytes = 0;
   vertex_t* oc = thrust::raw_pointer_cast(out.column_indices.data());

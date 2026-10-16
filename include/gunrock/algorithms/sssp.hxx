@@ -72,7 +72,7 @@ inline bool sssp_fuse() {
 
 namespace delta {
 
-constexpr int kBlock = 256;
+constexpr int kBlock = gacge::lb::kBlock;  // loops' launch box
 constexpr int kBinSizeThreshold = 1000;  // GAP's
 constexpr int kQueue = 1024;             // a block's current bin, >= the threshold
 
@@ -194,7 +194,7 @@ __device__ __forceinline__ void block_add(value_t x, unsigned long long* to) {
 template <int Gs, typename graph_t, typename vertex_t, typename weight_t>
 __global__ void __launch_bounds__(kBlock)
     step_kernel(graph_t G, step_t<vertex_t, weight_t> p, step_items_t<graph_t, weight_t> items, long long n,
-                const unsigned long long* offsets, int grain) {
+                gacge::lb::merge_args_t m) {
   __shared__ fusion_shared_t<vertex_t> sh;
   const int t = threadIdx.x;
   if (t == 0)
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(kBlock)
     relax_edge(G, p, sh, u, e);
     return false;
   };
-  gacge::lb::for_edges<Gs>(items, n, offsets, grain, f);
+  gacge::lb::for_edges<Gs>(items, n, m, f);
   __syncthreads();
   // GAP's bin fusion: while the local current bin is non-empty and below the threshold
   while (p.fuse) {
@@ -308,7 +308,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   uint8_t* marked = nullptr;
   unsigned long long* d_work = nullptr;
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
-  gacge::lb::offsets_t offsets;  // merge: the step's prefix sum of edges
+  gacge::lb::merge_t merge;  // merge-path: the step's prefix sum of edges and its merge tiles
 
   cudaStream_t stream() { return this->context->get_context(0)->stream(); }
   std::size_t desc_size() const { return 3 * (std::size_t)(R + 1) + 1; }
@@ -376,8 +376,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
     cudaMemsetAsync(marked, 0, n, stream());
     if (std::getenv("GACGE_TRAVERSAL_STATS"))
       cudaMallocAsync(&d_work, sizeof(unsigned long long), stream());
-    if (lb == gacge::lb::mode_t::merge)
-      offsets.reserve(cap);
+    if (lb == gacge::lb::mode_t::merge) {
+      merge.reserve(cap);
+      merge.reserve_work((long long)cap + g.get_number_of_edges());
+    }
   }
 
   void reset() override {
@@ -529,11 +531,16 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       gacge::lb::dispatch(P->lb, [&](auto tag) {
         constexpr int Gs = decltype(tag)::value;
         if constexpr (Gs == 0) {
-          P->offsets.reserve(n);
-          gacge::lb::prefix(items, n, P->offsets.data, P->stream());
+          P->merge.reserve(n);
+          P->merge.prefix(items, n, P->stream());
+          const gacge::lb::merge_args_t m = P->merge.plan(P->merge.offsets, n, P->stream());
+          if (P->merge.tiles > 0)
+            delta::step_kernel<0><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(G, P->step(), items,
+                                                                                                 n, m);
+        } else {
+          delta::step_kernel<Gs><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(G, P->step(), items, n,
+                                                                                        gacge::lb::merge_args_t{});
         }
-        delta::step_kernel<Gs><<<gacge::lb::grid<Gs>(n), delta::kBlock, 0, P->stream()>>>(
-            G, P->step(), items, n, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain());
       });
       P->download_tails();
       P->recover_overflow();
