@@ -146,6 +146,68 @@ __global__ void __launch_bounds__(kBlock) bu_kernel(graph_t G, vertex_t* dist, v
   block_add(awake, counters + 2);
 }
 
+// GACGE_BFS_WARP (default 128, 0 off): the bottom-up step's thread-mapped
+// schedule with Merrill et al.'s warp level for the hubs: a thread scans its
+// vertex and stops at the first neighbor in the front, as GAP's; a vertex of
+// more than this many edges is scanned by its warp instead, 32 edges at a
+// time, still stopping at the first found (the thread-warp-CTA scheme of
+// Merrill, Garland and Grimshaw, PPoPP 2012). Without it a hub whose front
+// neighbor comes late holds one thread, and its block, for its whole list.
+inline long long bu_warp_degree() {
+  static const long long v = [] {
+    const char* e = std::getenv("GACGE_BFS_WARP");
+    return e ? std::atoll(e) : 128LL;
+  }();
+  return v;
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dist, vertex_t level, vertex_t n,
+                                                        const uint32_t* front, uint32_t* next,
+                                                        unsigned long long* counters, long long warp_degree) {
+  const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
+  const vertex_t u = blockIdx.x * kBlock + threadIdx.x;
+  const int lane = threadIdx.x & 31;
+  unsigned long long awake = 0;
+  bool big = false;
+  if (u < n && dist[u] == unvisited) {
+    const auto first = G.get_starting_edge(u), last = G.get_starting_edge(u + 1);
+    if ((long long)(last - first) > warp_degree) {
+      big = true;
+    } else {
+      for (auto e = first; e < last; ++e) {
+        if (get_bit(front, G.get_destination_vertex(e))) {
+          dist[u] = level + 1;  // only u's thread writes u
+          set_bit_atomic(next, u);
+          awake++;
+          break;
+        }
+      }
+    }
+  }
+  // the warp scans its hubs one by one, 32 edges at a time, stopping at the first found
+  unsigned big_lanes = __ballot_sync(0xffffffffu, big);
+  while (big_lanes) {
+    const int src_lane = __ffs(big_lanes) - 1;
+    big_lanes &= big_lanes - 1;
+    const vertex_t w = __shfl_sync(0xffffffffu, u, src_lane);
+    const auto first = G.get_starting_edge(w), last = G.get_starting_edge(w + 1);
+    for (auto e0 = first; e0 < last; e0 += 32) {
+      const auto e = e0 + lane;
+      const bool hit = e < last && get_bit(front, G.get_destination_vertex(e));
+      if (__ballot_sync(0xffffffffu, hit)) {
+        if (lane == src_lane) {
+          dist[w] = level + 1;
+          set_bit_atomic(next, w);
+          awake++;
+        }
+        break;
+      }
+    }
+  }
+  block_add(awake, counters + 2);
+}
+
 template <typename vertex_t>
 __global__ void queue_to_bitmap_kernel(const vertex_t* queue, unsigned long long n, uint32_t* bm) {
   const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -206,7 +268,12 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // switching state, allocated by init(), set by reset(), outside the timing
   bool gap_dobfs() const { return param.direction_optimized && rule_gap(); }
   vertex_t* queue[2] = {nullptr, nullptr};
-  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
+  // the schedule of each of GAP's two step kernels (the mapping is chosen per
+  // kernel): top-down merge-path (the frontier's edges spread evenly), bottom-up
+  // thread-mapped (a thread scans its vertex and stops at the first neighbor
+  // in the front, as GAP's); GACGE_LB_TD / GACGE_LB_BU, or GACGE_LB for both
+  gacge::lb::mode_t lb_td = gacge::lb::mode("GACGE_LB_TD", gacge::lb::mode_t::merge);
+  gacge::lb::mode_t lb_bu = gacge::lb::mode("GACGE_LB_BU", gacge::lb::mode_t::thread);
   gacge::lb::merge_t merge;  // merge-path: a step's prefix sum of edges and its merge tiles
   int cur = 0;
   unsigned long long queue_n = 0;
@@ -237,7 +304,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
       cudaMallocAsync(reinterpret_cast<void**>(&q), std::max<std::size_t>(n, 1) * sizeof(vertex_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&front), words * sizeof(uint32_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&curr), words * sizeof(uint32_t), stream());
-    if (lb == gacge::lb::mode_t::merge) {
+    if (lb_td == gacge::lb::mode_t::merge || lb_bu == gacge::lb::mode_t::merge) {
       merge.reserve(n);
       merge.reserve_work((long long)n + this->get_graph().get_number_of_edges());
     }
@@ -336,7 +403,11 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       {
         gap::bu_items_t<decltype(G)> items{G, dist};
         const long long nn = n;
-        gacge::lb::dispatch(P->lb, [&](auto tag) {
+        if (P->lb_bu == gacge::lb::mode_t::thread && gap::bu_warp_degree() > 0) {  // thread + warp for the hubs
+          gap::bu_twc_kernel<<<gacge::lb::grid(nn), gap::kBlock, 0, stream>>>(
+              G, dist, P->level, n, P->front, P->curr, P->d_counters, gap::bu_warp_degree());
+        } else
+        gacge::lb::dispatch(P->lb_bu, [&](auto tag) {
           constexpr int Gs = decltype(tag)::value;
           gacge::lb::merge_args_t m;
           unsigned int g = gacge::lb::grid(nn);
@@ -373,7 +444,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       gacge::lb::frontier_tiles_t<decltype(G)> items{G, P->queue[P->cur]};
       const long long nq = (long long)P->queue_n;
       vertex_t* next = P->queue[P->cur ^ 1];
-      gacge::lb::dispatch(P->lb, [&](auto tag) {
+      gacge::lb::dispatch(P->lb_td, [&](auto tag) {
         constexpr int Gs = decltype(tag)::value;
         gacge::lb::merge_args_t m;
         unsigned int g = gacge::lb::grid(nq);

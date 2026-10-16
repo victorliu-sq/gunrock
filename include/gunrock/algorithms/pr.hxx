@@ -43,29 +43,30 @@ inline bool pr_vertex() {
   return v;
 }
 
-// Default (or GACGE_PR=gacge, since 2026-10-15): GAP's pull (pr_spmv), the
-// neighbors' contributions summed under the load balancing GACGE_LB
-// (gacge_lb.hxx, pr_sum_kernel; the only GPU-specific choice of every GACGE
-// primitive), then one pass sets base + sum and the error (pr_finish_kernel),
-// as GAP's loop.
+// GACGE_PR=gacge: GAP's pull (pr_spmv), the neighbors' contributions summed
+// under the schedule GACGE_LB (gacge_lb.hxx, pr_sum_kernel; loops' flat
+// merge-path, thread- or group-mapped), then one pass sets base + sum and the
+// error (pr_finish_kernel), as GAP's loop. The default (pr_nr) is the same pull
+// under merge-path as Gunrock's neighborreduce implements it (moderngpu's
+// segmented reduce: tile-wide coalesced loads, a block-level segmented
+// reduction and a fixup), 1.5-2x loops' flat merge-path on PageRank.
 inline bool pr_gacge() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_PR");
-    return e == nullptr || std::string(e) == "gacge";
+    return e != nullptr && std::string(e) == "gacge";
   }();
   return v;
 }
 
-// GACGE_PR=nr: the pull with Gunrock's
-// neighborreduce operator (as its spmv): each edge yields its neighbor's
-// contribution and a segmented reduction (moderngpu, merge-path balanced) sums
-// every vertex's edges, no atomics; 3.04x the CPU in geometric mean on the
-// eight graphs against 2.82x for the warp kernel (GACGE_PR=warp). Needs the
-// moderngpu fork's midpoint fix (eb98fb0) for graphs over 2^30 edges.
+// Default (or GACGE_PR=nr, since 2026-10-16 again): the pull with Gunrock's
+// neighborreduce operator (merge-path, moderngpu's segmented reduce): each
+// edge yields its neighbor's contribution and the segmented reduction sums
+// every vertex's edges, no atomics. Needs the moderngpu fork's midpoint fix
+// (eb98fb0) for graphs over 2^30 edges.
 inline bool pr_nr() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_PR");
-    return e != nullptr && std::string(e) == "nr";
+    return e == nullptr || std::string(e) == "nr";
   }();
   return v;
 }

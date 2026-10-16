@@ -19,3 +19,9 @@ set_target_properties(${APPLICATION_NAME}
 
 message(STATUS "Example Added: ${APPLICATION_NAME}")
 # end /* Add CUDA executables */
+# begin /* pr_cusparse: PageRank's pull as cuSPARSE's SpMV, the GPU reference (GACGE) */
+add_executable(pr_cusparse pr_cusparse.cu)
+target_link_libraries(pr_cusparse PRIVATE essentials cusparse)
+set_target_properties(pr_cusparse PROPERTIES CUDA_ARCHITECTURES ${ESSENTIALS_ARCHITECTURES})
+message(STATUS "Example Added: pr_cusparse")
+# end /* pr_cusparse */

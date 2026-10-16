@@ -307,7 +307,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long* h_desc = nullptr;  // pinned
   uint8_t* marked = nullptr;
   unsigned long long* d_work = nullptr;
-  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);  // GAP's DeltaStep: many steps of small frontiers
   gacge::lb::merge_t merge;  // merge-path: the step's prefix sum of edges and its merge tiles
 
   cudaStream_t stream() { return this->context->get_context(0)->stream(); }

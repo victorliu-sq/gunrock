@@ -39,17 +39,16 @@ inline bool tc_block_mapped() {
   return block;
 }
 
-// Default (GACGE_TC=gap, since 2026-10-15): GAP's OrderedCount: every vertex u
-// finds its neighbors below u (GAP walks them until v > u; here a binary
-// search in the sorted list), and each edge (u, v) merges N(u) and N(v) below
-// v; the edges spread by the schedule GACGE_LB (gacge_lb.hxx, tc_count_kernel),
-// the counts summed per block into the total (GAP's reduction), no per-vertex
-// counts. GACGE_TC=edge: one thread per edge (its source found by a binary
-// search in the row offsets, the edges with d >= s idle).
+// Default (since 2026-10-16): GAP's OrderedCount with the edge as the tile,
+// thread-mapped: one thread per edge (its source by a binary search in the
+// row offsets), merging N(s) and N(d) below d for d < s, the others idle (GAP
+// breaks there). Each edge's merge is an independent task of its own cost, so
+// the edge, not the vertex, is TC's work unit. GACGE_TC=gap: the vertex as the
+// tile under GACGE_LB (tc_count_kernel), the counts summed per block.
 inline bool tc_gap() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_TC");
-    return e == nullptr || std::string(e) == "gap";
+    return e != nullptr && std::string(e) == "gap";
   }();
   return v;
 }

@@ -66,9 +66,8 @@ inline const char* name(mode_t m) {
   }
 }
 
-// GACGE_LB, else the primitive's default
-inline mode_t mode(mode_t def) {
-  const char* e = std::getenv("GACGE_LB");
+// a schedule's name, else def
+inline mode_t parse(const char* e, mode_t def) {
   if (e == nullptr)
     return def;
   if (std::strcmp(e, "thread") == 0) return mode_t::thread;
@@ -77,6 +76,12 @@ inline mode_t mode(mode_t def) {
   if (std::strcmp(e, "merge") == 0) return mode_t::merge;
   return mode_t::block;
 }
+
+// GACGE_LB, else the primitive's default
+inline mode_t mode(mode_t def) { return parse(std::getenv("GACGE_LB"), def); }
+
+// a kernel's own variable (e.g. GACGE_LB_TD), else GACGE_LB, else its default
+inline mode_t mode(const char* var, mode_t def) { return parse(std::getenv(var), mode(def)); }
 
 // f(tag_t<G>{}) for the schedule m
 template <typename func_t>
