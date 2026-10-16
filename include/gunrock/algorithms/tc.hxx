@@ -12,6 +12,7 @@
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/util/timer.hxx>
 #include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <thrust/binary_search.h>
 #include <cub/block/block_reduce.cuh>
@@ -204,6 +205,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // GACGE_TC=split: the queue of heavy edges (one slot per edge) and its length
   thrust::device_vector<edge_t> heavy;
   thrust::device_vector<unsigned long long> heavy_n;
+  gacge::task::stats_t task;  // GACGE_TASK_STATS
   // tc_gap: the total, the schedule, and merge-path's prefix sum of the edges below each vertex
   thrust::device_vector<unsigned long long> gap_counters;
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
@@ -274,7 +276,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     }
 
     if (P->param.oriented) {
-      auto oriented = [G, vertex_triangles_count] __host__ __device__(
+      const gacge::task::view_t task = P->task.view();  // GACGE_TASK_STATS
+      auto oriented = [G, vertex_triangles_count, task] __host__ __device__(
                           vertex_t const& source, vertex_t const& neighbor,
                           edge_t const& edge, weight_t const& weight) -> bool {
         if (neighbor < source) {
@@ -283,8 +286,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           edge_t i = G.get_starting_edge(source), ie = G.get_starting_edge(source + 1);
           edge_t j = G.get_starting_edge(neighbor), je = G.get_starting_edge(neighbor + 1);
           vertex_t count = 0;
+          unsigned long long steps = 0;  // task: this edge's intersection, its merge steps as executed
           while (i < ie && j < je) {
             vertex_t a = G.get_destination_vertex(i), b = G.get_destination_vertex(j);
+            steps++;
             if (a >= neighbor || b >= neighbor)
               break;
             if (a < b) {
@@ -297,6 +302,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
               j++;
             }
           }
+#ifdef __CUDA_ARCH__
+          gacge::task::record(task, steps);
+#endif
           if (count)
             math::atomic::add(&(vertex_triangles_count[source]), count);
         }
@@ -433,6 +441,7 @@ float run(graph_t& G,
   enactor_type enactor(&problem, context, props);
   auto time = enactor.enact();
   time += enactor.post_process();
+  problem.task.print("TC", "edge-intersection");
 
   // </boiler-plate>
   return time;

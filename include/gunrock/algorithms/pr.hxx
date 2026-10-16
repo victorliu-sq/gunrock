@@ -11,6 +11,7 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
@@ -589,6 +590,13 @@ float run(graph_t& G,
   float ms = enactor.enact();
   if (iterations)
     *iterations = enactor.iteration;
+  if (gacge::task::enabled()) {  // task: a vertex in an iteration, its in-edges; the same in every iteration
+    gacge::task::stats_t task;
+    const long long n = G.get_number_of_vertices();
+    using vertex_t = typename graph_t::vertex_type;
+    gacge::task::degree_tasks<<<(unsigned int)((n + 255) / 256), 256>>>(G, (const vertex_t*)nullptr, n, task.view());
+    task.print("PageRank", "vertex-iteration", "iterations=" + std::to_string(enactor.iteration));
+  }
   return ms;
   // </boiler-plate>
 }

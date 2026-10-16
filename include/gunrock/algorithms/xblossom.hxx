@@ -28,6 +28,7 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <cub/cub.cuh>
 #include <thrust/functional.h>
@@ -233,6 +234,14 @@ class engine_t {
                   (size_t)G_.get_number_of_edges(), searches, ts_steps_[0], ts_e_[0], ts_steps_[1], ts_e_[1],
                   ts_steps_[2], ts_e_[2], walks, walk_steps, paths, flips, direct, max_flips);
     }
+    if (gacge::task::enabled()) {
+      const unsigned long long long_tasks = task_walk_.tasks() + task_flip_.tasks();
+      task_all_.add(task_fe_ > long_tasks ? task_fe_ - long_tasks : 0ULL, 1);  // the plain edge checks
+      task_all_.print("X-Blossom", "frontier-edge");
+      task_walk_.print("X-Blossom", "closing-edge");
+      task_flip_.print("X-Blossom", "augmenting-edge");
+      task_fe_ = 0;
+    }
     cudaDeviceSynchronize();
   }
 
@@ -308,6 +317,9 @@ class engine_t {
   frontier_t output_frontier_;  // unused: the advances write no output frontier
   gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
+
+  gacge::task::stats_t task_all_, task_walk_, task_flip_;  // GACGE_TASK_STATS
+  unsigned long long task_fe_{0};                          // the frontier edges of the run's advances
 
   // GACGE_XB_CLAIM: the augment step's tree claims. gap: XB-GAP's protocol (a
   // thread meeting a held tree gives up). tentative: a thread waits out a
@@ -428,6 +440,17 @@ class engine_t {
   template <typename op_t>
   void Advance(op_t op) {
     if (ts_on_) TraversalStep();
+    if (gacge::task::enabled()) {  // every frontier edge is a task; the plain checks are added up at the end
+      const size_t n = input_frontier_.get_number_of_elements();
+      if (n > 0) {
+        auto g = G_;
+        auto first = input_frontier_.begin();
+        task_fe_ += thrust::transform_reduce(
+            thrust::device, first, first + n,
+            [g] __device__(vertex_t const& v) -> unsigned long long { return (unsigned long long)g.get_number_of_neighbors(v); },
+            0ULL, thrust::plus<unsigned long long>());
+      }
+    }
     if (gacge::lb::enabled()) {  // the schedule GACGE_LB of every GACGE primitive (gacge_lb.hxx)
       gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::merge), G_, op, input_frontier_.data(),
                          (long long)input_frontier_.get_number_of_elements(), lb_merge_,
@@ -514,6 +537,7 @@ class engine_t {
     const bool search_stats = SearchStats();
     const int claim_mode = ClaimMode();
     const int claim_spin = ClaimSpin();
+    const gacge::task::view_t task_all = task_all_.view(), task_flip = task_flip_.view();
     auto conflicts_v = dev_conflicts_.DeviceView();
     auto matching_v = dev_matching_.DeviceView();
     auto path_table_v = path_table_.DeviceView();
@@ -523,6 +547,7 @@ class engine_t {
     auto found_v = dev_found_.DeviceView();
 
     Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      const gacge::task::view_t t_all = task_all, t_flip = task_flip;
       auto matching = matching_v;
       auto path_table = path_table_v;
       auto is_even = is_even_v;
@@ -557,6 +582,10 @@ class engine_t {
           }
           path_table.AddAugmentingPath(v, w, matching);
           atomicExch(&found, DFLAG_TRUE);
+          if constexpr (kTuple) {  // task: an augmenting edge, its check and its flips
+            gacge::task::record(t_all, 1 + path_table.LastSteps());
+            gacge::task::record(t_flip, 1 + path_table.LastSteps());
+          }
         };
         claim();
       }
@@ -644,7 +673,9 @@ class engine_t {
       const bool count = count_;
       if (count) dev_blossoms_.SetH2D(0);
       auto blossoms_v = dev_blossoms_.DeviceView();
+      const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view();
       Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+        const gacge::task::view_t t_all = task_all, t_walk = task_walk;
         auto matching = matching_v;
         auto path_table = path_table_v;
         auto is_even = is_even_v;
@@ -659,9 +690,17 @@ class engine_t {
         if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
           index_t base;
           path_table.FindBlossomBaseByAnchorNode(v, w, base);
+          unsigned long long len = 1;  // task: a closing edge, its check, base walk and two chain scans
+          if constexpr (kTuple) len += path_table.LastSteps();
           if (count) atomicAdd(&blossoms_v, 1ULL);
           ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, v, w, base);
+          if constexpr (kTuple) len += path_table.LastSteps();
           ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, w, v, base);
+          if constexpr (kTuple) {
+            len += path_table.LastSteps();
+            gacge::task::record(t_all, len);
+            gacge::task::record(t_walk, len);
+          }
         }
         return false;
       });

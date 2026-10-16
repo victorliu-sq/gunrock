@@ -11,6 +11,7 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <cooperative_groups.h>
 #include <cub/block/block_reduce.cuh>
@@ -164,7 +165,8 @@ inline long long bu_warp_degree() {
 template <typename graph_t, typename vertex_t>
 __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dist, vertex_t level, vertex_t n,
                                                         const uint32_t* front, uint32_t* next,
-                                                        unsigned long long* counters, long long warp_degree) {
+                                                        unsigned long long* counters, long long warp_degree,
+                                                        gacge::task::view_t task = {}) {
   const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
   const vertex_t u = blockIdx.x * kBlock + threadIdx.x;
   const int lane = threadIdx.x & 31;
@@ -175,7 +177,8 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
     if ((long long)(last - first) > warp_degree) {
       big = true;
     } else {
-      for (auto e = first; e < last; ++e) {
+      auto e = first;
+      for (; e < last; ++e) {
         if (get_bit(front, G.get_destination_vertex(e))) {
           dist[u] = level + 1;  // only u's thread writes u
           set_bit_atomic(next, u);
@@ -183,6 +186,8 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
           break;
         }
       }
+      // task: the neighbors checked before the parent is found (all of them if none is)
+      gacge::task::record(task, (unsigned long long)(e < last ? e - first + 1 : last - first));
     }
   }
   // the warp scans its hubs one by one, 32 edges at a time, stopping at the first found
@@ -192,18 +197,23 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
     big_lanes &= big_lanes - 1;
     const vertex_t w = __shfl_sync(0xffffffffu, u, src_lane);
     const auto first = G.get_starting_edge(w), last = G.get_starting_edge(w + 1);
+    unsigned long long checked = (unsigned long long)(last - first);
     for (auto e0 = first; e0 < last; e0 += 32) {
       const auto e = e0 + lane;
       const bool hit = e < last && get_bit(front, G.get_destination_vertex(e));
-      if (__ballot_sync(0xffffffffu, hit)) {
+      const unsigned hits = __ballot_sync(0xffffffffu, hit);
+      if (hits) {
         if (lane == src_lane) {
           dist[w] = level + 1;
           set_bit_atomic(next, w);
           awake++;
         }
+        checked = (unsigned long long)(e0 - first) + (unsigned long long)__ffs(hits);  // up to the first hit
         break;
       }
     }
+    if (lane == src_lane)
+      gacge::task::record(task, checked);
   }
   block_add(awake, counters + 2);
 }
@@ -279,6 +289,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long queue_n = 0;
   uint32_t* front = nullptr;
   uint32_t* curr = nullptr;
+  gacge::task::stats_t task_td, task_bu;  // GACGE_TASK_STATS
   std::size_t words = 0;
   unsigned long long* d_counters = nullptr;
   unsigned long long* h_counters = nullptr;  // pinned
@@ -405,7 +416,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         const long long nn = n;
         if (P->lb_bu == gacge::lb::mode_t::thread && gap::bu_warp_degree() > 0) {  // thread + warp for the hubs
           gap::bu_twc_kernel<<<gacge::lb::grid(nn), gap::kBlock, 0, stream>>>(
-              G, dist, P->level, n, P->front, P->curr, P->d_counters, gap::bu_warp_degree());
+              G, dist, P->level, n, P->front, P->curr, P->d_counters, gap::bu_warp_degree(), P->task_bu.view());
         } else
         gacge::lb::dispatch(P->lb_bu, [&](auto tag) {
           constexpr int Gs = decltype(tag)::value;
@@ -443,6 +454,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     {
       gacge::lb::frontier_tiles_t<decltype(G)> items{G, P->queue[P->cur]};
       const long long nq = (long long)P->queue_n;
+      if (gacge::task::enabled() && nq > 0)  // task: a frontier vertex, its edges
+        gacge::task::degree_tasks<<<(unsigned int)((nq + 255) / 256), 256, 0, stream>>>(
+            G, (const vertex_t*)P->queue[P->cur], nq, P->task_td.view());
       vertex_t* next = P->queue[P->cur ^ 1];
       gacge::lb::dispatch(P->lb_td, [&](auto tag) {
         constexpr int Gs = decltype(tag)::value;
@@ -667,7 +681,10 @@ float run(graph_t& G,
   enactor_properties_t props;
   props.self_manage_frontiers = problem.gap_dobfs();
   enactor_type enactor(&problem, context, props);
-  return enactor.enact();
+  const float t = enactor.enact();
+  problem.task_td.print("BFS", "top-down");
+  problem.task_bu.print("BFS", "bottom-up");
+  return t;
 }
 
 }  // namespace bfs

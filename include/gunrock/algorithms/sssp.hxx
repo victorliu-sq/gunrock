@@ -11,6 +11,7 @@
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <gunrock/gacge_lb.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <cooperative_groups.h>
 #include <cub/block/block_scan.cuh>
@@ -90,6 +91,7 @@ struct step_t {
   uint8_t* marked;
   unsigned long long* work;  // relaxed edges, GACGE_TRAVERSAL_STATS only
   bool fuse;
+  gacge::task::view_t task{};  // GACGE_TASK_STATS
 
   __device__ vertex_t* buffer(int s) const {
     return reinterpret_cast<vertex_t*>(desc[s]);
@@ -147,6 +149,7 @@ __device__ __forceinline__ void relax_edge(const graph_t& G, const step_t<vertex
   const vertex_t v = G.get_destination_vertex(e);
   const weight_t nd = p.dist[u] + G.get_edge_weight(e);
   if (relax(p.dist, v, nd)) {
+    gacge::task::count(p.task, 0, 1);  // a successful relaxation
     const long long b = (long long)(nd / p.delta);
     if (b == p.bin && p.fuse) {
       const int q = atomicAdd(&sh.queued, 1);
@@ -202,6 +205,8 @@ __global__ void __launch_bounds__(kBlock)
   __syncthreads();
   unsigned long long work = 0;
   auto f = [&](long long, vertex_t u, long long e) {
+    if (p.task.cnt && e == (long long)G.get_starting_edge(u))  // task: a bin vertex, its edges
+      gacge::task::record(p.task, (unsigned long long)G.get_number_of_neighbors(u));
     work++;
     relax_edge(G, p, sh, u, e);
     return false;
@@ -292,6 +297,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using edge_t = typename graph_t::edge_type;
   using weight_t = typename graph_t::weight_type;
   using buffer_t = std::pair<vertex_t*, unsigned long long>;  // pointer, capacity
+  gacge::task::stats_t task;  // GACGE_TASK_STATS
 
   thrust::device_vector<vertex_t> visited;
 
@@ -322,7 +328,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   }
 
   delta::step_t<vertex_t, weight_t> step() {
-    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse()};
+    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), task.view()};
   }
 
   // the buffers' pointers and capacities to the descriptor, tails kept
@@ -620,6 +626,11 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
 };  // struct enactor_t
 
+template <typename weight_t>
+struct sssp_reached_t {
+  __host__ __device__ bool operator()(weight_t x) const { return x < std::numeric_limits<weight_t>::max(); }
+};
+
 template <typename graph_t>
 float run(graph_t& G,
           typename graph_t::vertex_type& single_source,  // Parameter
@@ -653,7 +664,14 @@ float run(graph_t& G,
   enactor_properties_t props;
   props.self_manage_frontiers = sssp_delta();
   enactor_type enactor(&problem, context, props);
-  return enactor.enact();
+  const float t = enactor.enact();
+  if (gacge::task::enabled()) {  // the reached vertices: a vertex taken more than once was reinserted
+    auto d = thrust::device_pointer_cast(distances);
+    const long long reached = thrust::count_if(thrust::device, d, d + G.get_number_of_vertices(),
+                                               sssp_reached_t<typename graph_t::weight_type>{});
+    problem.task.print("SSSP", "bin-vertex", "reached=" + std::to_string(reached));
+  }
+  return t;
   // </boiler-plate>
 }
 

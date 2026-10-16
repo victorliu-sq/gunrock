@@ -231,6 +231,7 @@ namespace zblossom {
           steps++;
         }
         blossom_base = cur_v;
+        last_steps_ = steps;  // GACGE_TASK_STATS: this walk's dependent steps
         if (count_) { atomicAdd(&walks_, 1ULL); atomicAdd(&walk_steps_, steps); }
       }
 
@@ -240,13 +241,18 @@ namespace zblossom {
       template<typename F>
       DEV_INLINE void ForEachRecordedOddOnChain(index_t s, index_t base, F f) const {
         index_t cur = s;
+        last_steps_ = 0;  // GACGE_TASK_STATS: the records this chain visits
         while (cur != base) {
           const Rec r = Load(cur);
+          last_steps_++;
           if (IsEmpty(r)) return; // the root without meeting the base: cannot happen in a static forest
           if (IsTwo(r)) f(r.a);
           cur = Anchor(r);
         }
       }
+
+      // GACGE_TASK_STATS: the steps of the last base walk, chain scan or path flip of this view
+      DEV_INLINE unsigned long long LastSteps() const { return last_steps_; }
 
       // Flip the matching along the augmenting path v ~> root_v, (v, w), w ~> root_w
       DEV_INLINE void AddAugmentingPath(index_t v, index_t w, DArrayView<index_t> matching) {
@@ -255,6 +261,7 @@ namespace zblossom {
         unsigned long long flips = 0;
         FlipRoute(v, matching, flips);
         FlipRoute(w, matching, flips);
+        last_steps_ = flips;  // GACGE_TASK_STATS: the pairs this path flips
         __threadfence();
         if (count_) {
           atomicAdd(&paths_, 1ULL);
@@ -366,6 +373,7 @@ namespace zblossom {
       DValueView<int> cycle_overflow_;
       bool count_;
       DValueView<unsigned long long> walks_, walk_steps_, paths_, path_flips_, direct_paths_, max_flips_;
+      mutable unsigned long long last_steps_ = 0;  // GACGE_TASK_STATS: the last walk's, chain's or flip's steps
     };
 
     inline TuplePathTableView TuplePathTable::DeviceView() {
