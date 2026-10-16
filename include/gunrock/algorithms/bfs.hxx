@@ -112,9 +112,10 @@ template <int Gs, typename graph_t, typename vertex_t>
 __global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, vertex_t level,
                                                     gacge::lb::frontier_tiles_t<graph_t> items, long long n,
                                                     gacge::lb::merge_args_t m, vertex_t* next,
-                                                    unsigned long long* counters) {
-  unsigned long long scout = 0;
+                                                    unsigned long long* counters, gacge::task::view_t thr = {}) {
+  unsigned long long scout = 0, mine = 0;
   gacge::lb::for_edges<Gs>(items, n, m, [&](long long, vertex_t, long long e) {
+    mine++;  // GACGE_TASK_STATS: this thread's edges
     const vertex_t v = G.get_destination_vertex(e);
     if (claim(dist, v, level)) {
       push_back(next, counters + 0, v);
@@ -122,6 +123,8 @@ __global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, v
     }
     return false;
   });
+  if (mine)
+    gacge::task::record(thr, mine);
   block_add(scout, counters + 1);
 }
 
@@ -166,7 +169,8 @@ template <typename graph_t, typename vertex_t>
 __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dist, vertex_t level, vertex_t n,
                                                         const uint32_t* front, uint32_t* next,
                                                         unsigned long long* counters, long long warp_degree,
-                                                        gacge::task::view_t task = {}) {
+                                                        gacge::task::view_t task = {}, gacge::task::view_t thr = {}) {
+  unsigned long long mine = 0;  // GACGE_TASK_STATS: this thread's neighbor checks, its vertex's and its warp's hubs' rounds
   const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
   const vertex_t u = blockIdx.x * kBlock + threadIdx.x;
   const int lane = threadIdx.x & 31;
@@ -188,6 +192,7 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
       }
       // task: the neighbors checked before the parent is found (all of them if none is)
       gacge::task::record(task, (unsigned long long)(e < last ? e - first + 1 : last - first));
+      mine += (unsigned long long)(e < last ? e - first + 1 : last - first);
     }
   }
   // the warp scans its hubs one by one, 32 edges at a time, stopping at the first found
@@ -200,6 +205,7 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
     unsigned long long checked = (unsigned long long)(last - first);
     for (auto e0 = first; e0 < last; e0 += 32) {
       const auto e = e0 + lane;
+      mine++;  // a round: one check per lane
       const bool hit = e < last && get_bit(front, G.get_destination_vertex(e));
       const unsigned hits = __ballot_sync(0xffffffffu, hit);
       if (hits) {
@@ -215,6 +221,8 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
     if (lane == src_lane)
       gacge::task::record(task, checked);
   }
+  if (mine)
+    gacge::task::record(thr, mine);
   block_add(awake, counters + 2);
 }
 
@@ -289,7 +297,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long queue_n = 0;
   uint32_t* front = nullptr;
   uint32_t* curr = nullptr;
-  gacge::task::stats_t task_td, task_bu;  // GACGE_TASK_STATS
+  gacge::task::stats_t task_td, task_bu;      // GACGE_TASK_STATS: per task
+  gacge::task::stats_t thread_td, thread_bu;  // GACGE_TASK_STATS: per thread and step
   std::size_t words = 0;
   unsigned long long* d_counters = nullptr;
   unsigned long long* h_counters = nullptr;  // pinned
@@ -416,7 +425,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         const long long nn = n;
         if (P->lb_bu == gacge::lb::mode_t::thread && gap::bu_warp_degree() > 0) {  // thread + warp for the hubs
           gap::bu_twc_kernel<<<gacge::lb::grid(nn), gap::kBlock, 0, stream>>>(
-              G, dist, P->level, n, P->front, P->curr, P->d_counters, gap::bu_warp_degree(), P->task_bu.view());
+              G, dist, P->level, n, P->front, P->curr, P->d_counters, gap::bu_warp_degree(), P->task_bu.view(), P->thread_bu.view());
         } else
         gacge::lb::dispatch(P->lb_bu, [&](auto tag) {
           constexpr int Gs = decltype(tag)::value;
@@ -435,6 +444,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       P->read_counters();
       P->awake = (long long)P->h_counters[2];
       std::swap(P->front, P->curr);
+      P->thread_bu.print("BFS", "thread-bottom-up", "level=" + std::to_string(P->level));
       P->level++;
       if (!(P->awake >= old_awake || P->awake > (long long)n / gap::kBeta)) {
         // BitmapToQueue(g, front, queue); scout_count = 1
@@ -467,13 +477,15 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           m = P->merge.plan(P->merge.offsets, nq, stream);
           g = (unsigned int)std::max<long long>(1, P->merge.tiles);
         }
-        gap::td_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(G, dist, P->level, items, nq, m, next, P->d_counters);
+        gap::td_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(G, dist, P->level, items, nq, m, next, P->d_counters,
+                                                         P->thread_td.view());
       });
     }
     P->read_counters();
     P->cur ^= 1;
     P->queue_n = P->h_counters[0];
     P->scout = (long long)P->h_counters[1];
+    P->thread_td.print("BFS", "thread-top-down", "level=" + std::to_string(P->level));
     P->level++;
   }
 

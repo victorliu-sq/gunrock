@@ -91,7 +91,8 @@ struct step_t {
   uint8_t* marked;
   unsigned long long* work;  // relaxed edges, GACGE_TRAVERSAL_STATS only
   bool fuse;
-  gacge::task::view_t task{};  // GACGE_TASK_STATS
+  gacge::task::view_t task{};    // GACGE_TASK_STATS: per bin vertex
+  gacge::task::view_t thread{};  // GACGE_TASK_STATS: per thread and step
 
   __device__ vertex_t* buffer(int s) const {
     return reinterpret_cast<vertex_t*>(desc[s]);
@@ -249,6 +250,8 @@ __global__ void __launch_bounds__(kBlock)
       __syncthreads();
     }
   }
+  if (work)
+    gacge::task::record(p.thread, work);  // this thread's edges in the step
   if (p.work)
     block_add(work, p.work);
 }
@@ -297,7 +300,9 @@ struct problem_t : gunrock::problem_t<graph_t> {
   using edge_t = typename graph_t::edge_type;
   using weight_t = typename graph_t::weight_type;
   using buffer_t = std::pair<vertex_t*, unsigned long long>;  // pointer, capacity
-  gacge::task::stats_t task;  // GACGE_TASK_STATS
+  gacge::task::stats_t task;    // GACGE_TASK_STATS: per bin vertex
+  gacge::task::stats_t thread;  // GACGE_TASK_STATS: per thread and step
+  long long thread_step = 0;
 
   thrust::device_vector<vertex_t> visited;
 
@@ -328,7 +333,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   }
 
   delta::step_t<vertex_t, weight_t> step() {
-    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), task.view()};
+    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), task.view(), thread.view()};
   }
 
   // the buffers' pointers and capacities to the descriptor, tails kept
@@ -549,6 +554,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         }
       });
       P->download_tails();
+      if (gacge::task::enabled())
+        P->thread.print("SSSP", "thread-step", "step=" + std::to_string(P->thread_step++));
       P->recover_overflow();
       // the next frontier: the current bin again, else the lowest non-empty bin
       int s = -1;

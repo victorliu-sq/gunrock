@@ -318,7 +318,7 @@ class engine_t {
   gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
 
-  gacge::task::stats_t task_all_, task_walk_, task_flip_, task_step_;  // GACGE_TASK_STATS
+  gacge::task::stats_t task_all_, task_walk_, task_flip_, task_step_, task_thr_;  // GACGE_TASK_STATS
   size_t blossom_step_{0};                                             // the blossom steps printed
   unsigned long long task_fe_{0};                          // the frontier edges of the run's advances
 
@@ -435,6 +435,25 @@ class engine_t {
       std::printf("XBStep: run=%d step=%zu phase=%s frontier_v=%zu frontier_e=%zu max_deg=%zu\n", ts_run_,
                   ts_steps_[0] + ts_steps_[1] + ts_steps_[2] - 1, names[k], n, fe, max_deg);
     }
+  }
+
+  // GACGE_TASK_STATS: Advance with each thread's work added up and recorded (-l gacge)
+  template <typename op_t>
+  void AdvanceCount(op_t op, gacge::task::view_t v) {
+    if (ts_on_) TraversalStep();
+    const size_t n = input_frontier_.get_number_of_elements();
+    if (n > 0) {
+      auto g = G_;
+      auto first = input_frontier_.begin();
+      task_fe_ += thrust::transform_reduce(
+          thrust::device, first, first + n,
+          [g] __device__(vertex_t const& x) -> unsigned long long { return (unsigned long long)g.get_number_of_neighbors(x); },
+          0ULL, thrust::plus<unsigned long long>());
+    }
+    gacge::lb::advance_count(gacge::lb::mode(gacge::lb::mode_t::merge), G_, op, input_frontier_.data(), (long long)n,
+                             lb_merge_, context_->get_context(0)->stream(), v);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   // One advance over the loaded frontier with LB; op returns false (no output).
@@ -677,7 +696,7 @@ class engine_t {
       const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view(),
                                 task_step = task_step_.view();
       const unsigned long long fe_before = task_fe_;
-      Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
+      auto blossom_op = [=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> unsigned long long {
         const gacge::task::view_t t_all = task_all, t_walk = task_walk, t_step = task_step;
         auto matching = matching_v;
         auto path_table = path_table_v;
@@ -688,6 +707,7 @@ class engine_t {
         auto task_s = nodes_in_blossom_v;
         auto task_o = odd_vside_in_blossom_v;
         auto task_base = odd_in_blossom_v;
+        unsigned long long work = 1;  // the check; a closing edge adds its walk
         index_t root_v = tree_roots[v];
         index_t root_w = tree_roots[w];
         if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
@@ -701,13 +721,18 @@ class engine_t {
           ClaimOddNodesOnChain(path_table, is_even, locks, task_node, task_s, task_o, task_base, w, v, base);
           if constexpr (kTuple) {
             len += path_table.LastSteps();
+            work = len;
             gacge::task::record(t_all, len);
             gacge::task::record(t_walk, len);
             gacge::task::record(t_step, len - 1);  // this step's walk: base walk + the two chain scans
           }
         }
-        return false;
-      });
+        return work;
+      };
+      if (gacge::task::enabled())
+        AdvanceCount(blossom_op, task_thr_.view());
+      else
+        Advance(blossom_op);
       if (count) blossoms_ += dev_blossoms_.GetD2H();
       if (gacge::task::enabled()) {  // one line per blossom step: its frontier edges, the closing ones' walks
         const unsigned long long fe = task_fe_ - fe_before, closing = task_step_.tasks();
@@ -715,6 +740,7 @@ class engine_t {
         task_step_.print("X-Blossom", "blossom-step",
                          "step=" + std::to_string(blossom_step_) + " frontier_e=" + std::to_string(fe) +
                              " closing=" + std::to_string(closing));
+        task_thr_.print("X-Blossom", "thread-blossom-step", "step=" + std::to_string(blossom_step_));
         blossom_step_++;
       }
       const size_t num_tasks = blossom_offset_list_.size();

@@ -27,6 +27,7 @@
 #pragma once
 
 #include <loops/schedule.hxx>
+#include <gunrock/gacge_task_stats.hxx>
 
 #include <thrust/execution_policy.h>
 #include <thrust/functional.h>
@@ -380,6 +381,43 @@ __global__ void __launch_bounds__(kBlock)
   for_edges<G>(tiles, n, m, [&](long long, vertex_t u, long long e) {
     op(u, g.get_destination_vertex((edge_t)e), (edge_t)e, g.get_edge_weight((edge_t)e));
     return false;
+  });
+}
+
+// GACGE_TASK_STATS: the advance with each thread's work added up (op returns its
+// edge's work) and recorded once per thread that had any
+template <int G, typename graph_t, typename op_t>
+__global__ void __launch_bounds__(kBlock)
+    advance_count_kernel(graph_t g, op_t op, frontier_tiles_t<graph_t> tiles, long long n, merge_args_t m,
+                         gacge::task::view_t v) {
+  using vertex_t = typename graph_t::vertex_type;
+  using edge_t = typename graph_t::edge_type;
+  unsigned long long mine = 0;
+  for_edges<G>(tiles, n, m, [&](long long, vertex_t u, long long e) {
+    mine += (unsigned long long)op(u, g.get_destination_vertex((edge_t)e), (edge_t)e, g.get_edge_weight((edge_t)e));
+    return false;
+  });
+  if (mine)
+    gacge::task::record(v, mine);
+}
+
+template <typename graph_t, typename op_t>
+void advance_count(mode_t md, graph_t& g, op_t op, const typename graph_t::vertex_type* frontier, long long n,
+                   merge_t& mg, cudaStream_t stream, gacge::task::view_t v) {
+  if (n <= 0)
+    return;
+  frontier_tiles_t<graph_t> tiles{g, frontier};
+  dispatch(md, [&](auto tag) {
+    constexpr int G = decltype(tag)::value;
+    if constexpr (G == 0) {
+      mg.reserve(n);
+      mg.prefix(tiles, n, stream);
+      const merge_args_t m = mg.plan(mg.offsets, n, stream);
+      if (mg.tiles > 0)
+        advance_count_kernel<0><<<(unsigned int)mg.tiles, kBlock, 0, stream>>>(g, op, tiles, n, m, v);
+    } else {
+      advance_count_kernel<G><<<grid(n), kBlock, 0, stream>>>(g, op, tiles, n, merge_args_t{}, v);
+    }
   });
 }
 

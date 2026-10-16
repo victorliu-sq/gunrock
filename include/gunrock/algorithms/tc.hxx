@@ -91,6 +91,44 @@ __device__ __forceinline__ vertex_t tc_merge(const graph_t& G, vertex_t s, verte
   return count;
 }
 
+// GACGE_TASK_STATS: each thread's merge steps as the timed per-edge launch
+// spreads the edges (thrust::for_each, CUB's policy_500: 256 threads a block,
+// 2 edges a thread, block-striped), counted only, recorded once per thread
+// with any work
+template <typename graph_t>
+__global__ void tc_thread_stats_kernel(graph_t G, gacge::task::view_t v) {
+  using edge_t = typename graph_t::edge_type;
+  using vertex_t = typename graph_t::vertex_type;
+  const long long m = G.get_number_of_edges();
+  unsigned long long mine = 0;
+  for (int j = 0; j < 2; ++j) {
+    const long long e = (long long)blockIdx.x * 512 + threadIdx.x + j * 256;
+    if (e >= m)
+      break;
+    const vertex_t s = G.get_source_vertex((edge_t)e), d = G.get_destination_vertex((edge_t)e);
+    if (d >= s)
+      continue;
+    edge_t i = G.get_starting_edge(s), ie = G.get_starting_edge(s + 1);
+    edge_t k = G.get_starting_edge(d), ke = G.get_starting_edge(d + 1);
+    while (i < ie && k < ke) {
+      const vertex_t a = G.get_destination_vertex(i), b = G.get_destination_vertex(k);
+      mine++;
+      if (a >= d || b >= d)
+        break;
+      if (a < b)
+        i++;
+      else if (b < a)
+        k++;
+      else {
+        i++;
+        k++;
+      }
+    }
+  }
+  if (mine)
+    gacge::task::record(v, mine);
+}
+
 // the edges (u, v), v < u, of u: N(u)'s entries below u
 template <typename graph_t, typename vertex_t>
 __device__ __forceinline__ long long tc_lower(const graph_t& G, vertex_t u) {
@@ -205,7 +243,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // GACGE_TC=split: the queue of heavy edges (one slot per edge) and its length
   thrust::device_vector<edge_t> heavy;
   thrust::device_vector<unsigned long long> heavy_n;
-  gacge::task::stats_t task;  // GACGE_TASK_STATS
+  gacge::task::stats_t task;    // GACGE_TASK_STATS: per edge
+  gacge::task::stats_t thread;  // GACGE_TASK_STATS: per thread
   // tc_gap: the total, the schedule, and merge-path's prefix sum of the edges below each vertex
   thrust::device_vector<unsigned long long> gap_counters;
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
@@ -347,6 +386,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
         };
         operators::parallel_for::execute<operators::parallel_for_each_t::edge>(
             G, per_edge, context);
+        if (gacge::task::enabled()) {
+          const long long m = G.get_number_of_edges();
+          tc_thread_stats_kernel<<<(unsigned int)((m + 511) / 512), 256>>>(G, P->thread.view());
+        }
       }
       return;
     }
@@ -442,6 +485,7 @@ float run(graph_t& G,
   auto time = enactor.enact();
   time += enactor.post_process();
   problem.task.print("TC", "edge-intersection");
+  problem.thread.print("TC", "thread");
 
   // </boiler-plate>
   return time;
