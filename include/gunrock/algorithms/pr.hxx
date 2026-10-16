@@ -171,25 +171,16 @@ __global__ void __launch_bounds__(gacge::lb::kBlock)
   constexpr int kBlock = gacge::lb::kBlock;
   const vertex_t n = G.get_number_of_vertices();
   all_items_t<graph_t> items{G};
-  if constexpr (Gs == 1) {  // a thread owns its vertex: its sum is stored
-    long long cur = -1;
-    weight_t acc = 0;
-    gacge::lb::thread_mapped(items, n, [&](long long i, vertex_t, long long e) {
-      if (i != cur) {
-        if (cur >= 0)
-          sums[cur] = acc;
-        cur = i;
-        acc = 0;
-      }
-      acc += contrib[G.get_destination_vertex(e)];
-      return false;
-    });
-    if (cur >= 0)
-      sums[cur] = acc;
-    // a vertex without edges: 0
-    const long long v = (long long)blockIdx.x * kBlock + threadIdx.x;
-    if (v < n && G.get_number_of_neighbors((vertex_t)v) == 0)
-      sums[v] = 0;
+  if constexpr (Gs == 1) {  // loops' thread_mapped over the CSR rows, as loops' SpMV
+    using setup_t = loops::schedule::setup<loops::schedule::algorithms_t::thread_mapped, 1, 1, int, int, int, int>;
+    setup_t config(const_cast<int*>(G.get_row_offsets()), (int)n, (int)G.get_number_of_edges());
+    const auto* col = G.get_column_indices();
+    for (auto row : config.tiles()) {
+      weight_t sum = 0;
+      for (auto e : config.atoms(row))
+        sum += contrib[col[e]];
+      sums[row] = sum;
+    }
   } else if constexpr (Gs > 1) {
     __shared__ weight_t s_sum[kBlock];
     const long long first = (long long)blockIdx.x * kBlock;
