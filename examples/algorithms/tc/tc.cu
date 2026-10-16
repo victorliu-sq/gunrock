@@ -6,6 +6,7 @@
 
 #include <cxxopts.hpp>
 
+#include <cub/block/block_scan.cuh>
 #include <cub/device/device_segmented_sort.cuh>
 #include <thrust/binary_search.h>
 #include <thrust/scan.h>
@@ -90,6 +91,46 @@ bool gap_worth_relabelling(const std::vector<edge_t>& off) {
   return sample_average / 1.3 > sample_median;
 }
 
+// RelabelByDegree's list mapping (GAP: each vertex writes its neighbors' new
+// ids into its new list): a block takes 256 vertices and its threads share
+// their edges (degrees scanned in the block), no search per edge.
+template <typename vertex_t, typename edge_t>
+__global__ void __launch_bounds__(256) relabel_map_kernel(const edge_t* off, const vertex_t* col,
+                                                          const edge_t* noff, const vertex_t* nid,
+                                                          vertex_t* mc, vertex_t n) {
+  using scan_t = cub::BlockScan<long long, 256>;
+  __shared__ typename scan_t::TempStorage temp;
+  __shared__ long long s_off[256];
+  __shared__ vertex_t s_u[256];
+  const int t = threadIdx.x;
+  const long long first = (long long)blockIdx.x * 256;
+  const int k = (int)min((long long)256, (long long)n - first);
+  long long deg = 0;
+  if (t < k) {
+    const vertex_t u = (vertex_t)(first + t);
+    s_u[t] = u;
+    deg = (long long)(off[u + 1] - off[u]);
+  }
+  long long o, total;
+  scan_t(temp).ExclusiveSum(deg, o, total);
+  if (t < k)
+    s_off[t] = o;
+  __syncthreads();
+  for (long long i = t; i < total; i += 256) {
+    int lo = 0, hi = k - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (s_off[mid] <= i)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    const vertex_t u = s_u[lo];
+    const long long j = i - s_off[lo];
+    mc[noff[nid[u]] + j] = nid[col[off[u] + j]];
+  }
+}
+
 // GAP's RelabelByDegree on the device: vertices sorted by (degree, id),
 // largest first, take ids 0, 1, ...; every list is mapped and sorted again.
 template <typename csr_t>
@@ -125,11 +166,7 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
   const edge_t* noff = thrust::raw_pointer_cast(out.row_offsets.data());
   const vertex_t* nid = thrust::raw_pointer_cast(new_ids.data());
   vertex_t* mc = thrust::raw_pointer_cast(mapped.data());
-  thrust::for_each(thrust::counting_iterator<edge_t>(0), thrust::counting_iterator<edge_t>(m),
-                   [off, col, noff, nid, mc, n] __device__(edge_t e) {
-                     const vertex_t u = (vertex_t)(thrust::upper_bound(thrust::seq, off, off + n + 1, e) - off - 1);
-                     mc[noff[nid[u]] + (e - off[u])] = nid[col[e]];
-                   });
+  relabel_map_kernel<<<(unsigned int)(((long long)n + 255) / 256), 256>>>(off, col, noff, nid, mc, n);
   std::size_t temp_bytes = 0;
   vertex_t* oc = thrust::raw_pointer_cast(out.column_indices.data());
   cub::DeviceSegmentedSort::SortKeys(nullptr, temp_bytes, mc, oc, (int64_t)m, (int64_t)n, noff, noff + 1);

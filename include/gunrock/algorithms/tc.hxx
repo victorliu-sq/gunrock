@@ -13,6 +13,8 @@
 #include <gunrock/util/timer.hxx>
 
 #include <thrust/binary_search.h>
+#include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 
 #include <cstdlib>
 #include <string>
@@ -36,7 +38,33 @@ inline bool tc_block_mapped() {
   return block;
 }
 
-// GACGE_TC=split: one thread per edge as by default, but an edge whose end
+// GACGE_TC=gap: GAP's OrderedCount structure. A block takes
+// 256 vertices u; each finds its neighbors below u (GAP walks them until
+// v > u; here a binary search in the sorted list) and the block's threads
+// share those edges (u, v), each merging N(u) and N(v) below v; the counts are
+// summed per block into the total (GAP's reduction), no per-vertex counts. A
+// vertex with more than GACGE_TC_HEAVY (default 2048) such edges is spread
+// over the grid (tc_gap_heavy_kernel). Not the default: a block's merges
+// vary so much that it ran 1.3-2.9x slower on the eight graphs (Arabic's
+// count 780 -> 2020 ms) than the default one thread per edge (its source found
+// by a binary search in the row offsets, the edges with d >= s idle), whose
+// edge-level balance costs less than the search.
+inline bool tc_gap() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_TC");
+    return e != nullptr && std::string(e) == "gap";
+  }();
+  return v;
+}
+inline long long tc_gap_heavy() {
+  static const long long v = [] {
+    const char* e = std::getenv("GACGE_TC_HEAVY");
+    return e ? std::atoll(e) : 2048LL;
+  }();
+  return v;
+}
+
+// GACGE_TC=split: one thread per edge as GACGE_TC=edge, but an edge whose end
 // points' degrees sum to more than GACGE_TC_HEAVY (default 1024) is queued and
 // intersected by a whole warp (the lanes take the shorter list's entries below
 // d and binary-search them in the longer one), so a hub's long intersections
@@ -71,6 +99,93 @@ __device__ __forceinline__ vertex_t tc_merge(const graph_t& G, vertex_t s, verte
     else { count++; i++; j++; }
   }
   return count;
+}
+
+// the edges (u, v), v < u, of u: N(u)'s entries below u
+template <typename graph_t, typename vertex_t>
+__device__ __forceinline__ long long tc_lower(const graph_t& G, vertex_t u) {
+  const auto col = G.get_column_indices();
+  const auto* a = col + G.get_starting_edge(u);
+  return thrust::lower_bound(thrust::seq, a, a + G.get_number_of_neighbors(u), u) - a;
+}
+
+constexpr int kTcBlock = 256;
+
+// counters: [0] the total, [1] the heavy vertices (heavy[])
+template <typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(kTcBlock) tc_gap_kernel(graph_t G, vertex_t n, unsigned long long* counters,
+                                                          vertex_t* heavy, long long heavy_deg) {
+  using edge_t = typename graph_t::edge_type;
+  using scan_t = cub::BlockScan<long long, kTcBlock>;
+  using reduce_t = cub::BlockReduce<unsigned long long, kTcBlock>;
+  __shared__ union {
+    typename scan_t::TempStorage scan;
+    typename reduce_t::TempStorage reduce;
+  } temp;
+  __shared__ vertex_t s_u[kTcBlock];
+  __shared__ edge_t s_start[kTcBlock];
+  __shared__ long long s_off[kTcBlock];
+  const int t = threadIdx.x;
+  const long long first = (long long)blockIdx.x * kTcBlock;
+  const int k = (int)min((long long)kTcBlock, (long long)n - first);
+  long long lower = 0;
+  edge_t start = 0;
+  if (t < k) {
+    const vertex_t u = (vertex_t)(first + t);
+    s_u[t] = u;
+    start = G.get_starting_edge(u);
+    lower = tc_lower(G, u);
+    if (lower > heavy_deg) {  // tc_gap_heavy_kernel
+      heavy[atomicAdd(counters + 1, 1ULL)] = u;
+      lower = 0;
+    }
+  }
+  long long off, total;
+  scan_t(temp.scan).ExclusiveSum(lower, off, total);
+  if (t < k) {
+    s_off[t] = off;
+    s_start[t] = start;
+  }
+  __syncthreads();
+  unsigned long long count = 0;
+  for (long long i = t; i < total; i += kTcBlock) {
+    int lo = 0, hi = k - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) >> 1;
+      if (s_off[mid] <= i)
+        lo = mid;
+      else
+        hi = mid - 1;
+    }
+    const vertex_t u = s_u[lo];
+    const vertex_t v = G.get_destination_vertex(s_start[lo] + (edge_t)(i - s_off[lo]));
+    count += tc_merge(G, u, v);
+  }
+  __syncthreads();
+  const unsigned long long sum = reduce_t(temp.reduce).Sum(count);
+  if (t == 0 && sum)
+    atomicAdd(counters + 0, sum);
+}
+
+template <typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(kTcBlock) tc_gap_heavy_kernel(graph_t G, unsigned long long* counters,
+                                                                const vertex_t* heavy) {
+  using reduce_t = cub::BlockReduce<unsigned long long, kTcBlock>;
+  __shared__ typename reduce_t::TempStorage temp;
+  const unsigned long long nh = counters[1];
+  const long long gid = (long long)blockIdx.x * kTcBlock + threadIdx.x;
+  const long long stride = (long long)gridDim.x * kTcBlock;
+  unsigned long long count = 0;
+  for (unsigned long long h = 0; h < nh; h++) {
+    const vertex_t u = heavy[h];
+    const long long lower = tc_lower(G, u);
+    const auto start = G.get_starting_edge(u);
+    for (long long i = gid; i < lower; i += stride)
+      count += tc_merge(G, u, (vertex_t)G.get_destination_vertex(start + i));
+  }
+  const unsigned long long sum = reduce_t(temp).Sum(count);
+  if (threadIdx.x == 0 && sum)
+    atomicAdd(counters + 0, sum);
 }
 
 template <typename graph_t, typename vertex_t>
@@ -145,8 +260,19 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // GACGE_TC=split: the queue of heavy edges (one slot per edge) and its length
   thrust::device_vector<edge_t> heavy;
   thrust::device_vector<unsigned long long> heavy_n;
+  // tc_gap: the total and the heavy vertices
+  thrust::device_vector<unsigned long long> gap_counters;
+  thrust::device_vector<vertex_t> gap_heavy;
+  int gap_heavy_blocks = 0;
 
   void init() override {
+    if (tc_gap() && param.oriented) {
+      gap_counters.resize(2);
+      gap_heavy.resize(this->get_graph().get_number_of_vertices());
+      int sms = 0;
+      cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+      gap_heavy_blocks = sms * 8;
+    }
     if (tc_split()) {
       heavy.resize(this->get_graph().get_number_of_edges());
       heavy_n.resize(1);
@@ -175,6 +301,22 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto G = P->get_graph();
 
     auto vertex_triangles_count = P->result.vertex_triangles_count;
+
+    if (P->param.oriented && tc_gap()) {
+      auto stream = this->context->get_context(0)->stream();
+      unsigned long long* counters = P->gap_counters.data().get();
+      vertex_t* heavy = P->gap_heavy.data().get();
+      const vertex_t n = G.get_number_of_vertices();
+      cudaMemsetAsync(counters, 0, 2 * sizeof(unsigned long long), stream);
+      tc_gap_kernel<<<(unsigned int)(((long long)n + kTcBlock - 1) / kTcBlock), kTcBlock, 0, stream>>>(
+          G, n, counters, heavy, tc_gap_heavy());
+      tc_gap_heavy_kernel<<<P->gap_heavy_blocks, kTcBlock, 0, stream>>>(G, counters, heavy);
+      unsigned long long total = 0;  // GAP's OrderedCount returns the total
+      cudaMemcpyAsync(&total, counters, sizeof(total), cudaMemcpyDeviceToHost, stream);
+      cudaStreamSynchronize(stream);
+      *P->result.total_triangles_count = (std::size_t)total;
+      return;
+    }
 
     if (P->param.oriented) {
       auto oriented = [G, vertex_triangles_count] __host__ __device__(
@@ -288,7 +430,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto P = this->get_problem();
     auto G = P->get_graph();
 
-    if (P->param.reduce_all_triangles) {
+    if (P->param.reduce_all_triangles && !(tc_gap() && P->param.oriented)) {
       auto policy = this->context->get_context(0)->execution_policy();
       *P->result.total_triangles_count = thrust::transform_reduce(
           policy, P->result.vertex_triangles_count,

@@ -12,6 +12,7 @@
 #include <gunrock/algorithms/algorithms.hxx>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <cstdlib>
 #include <string>
@@ -103,6 +104,29 @@ __global__ void pull_warp_kernel(graph_t G,
     p[v] = base + sum;
 }
 
+// GAP's pr_spmv step (the default nr pull): the neighbors' sums go to a
+// buffer, and one pass sets each score to base + sum and adds |new - old| to
+// the iteration's error, as GAP's loop does (read only for a tolerance).
+template <typename weight_t>
+__global__ void pr_finish_kernel(const weight_t* __restrict__ sums,
+                                 weight_t* __restrict__ p,
+                                 std::size_t n,
+                                 weight_t base,
+                                 float* error) {
+  using reduce_t = cub::BlockReduce<float, 256>;
+  __shared__ typename reduce_t::TempStorage temp;
+  const std::size_t v = blockIdx.x * (std::size_t)blockDim.x + threadIdx.x;
+  float err = 0;
+  if (v < n) {
+    const weight_t score = base + sums[v];
+    err = fabsf(score - p[v]);
+    p[v] = score;
+  }
+  const float sum = reduce_t(temp).Sum(err);
+  if (threadIdx.x == 0 && sum != 0)
+    atomicAdd(error, sum);
+}
+
 template <typename weight_t>
 struct param_t {
   weight_t alpha;
@@ -141,12 +165,18 @@ struct problem_t : gunrock::problem_t<graph_t> {
   thrust::device_vector<weight_t>
       iweights;  // alpha * 1 / (sum of outgoing weights) -- used to determine
                  // out of mass spread from src to dst
+  thrust::device_vector<weight_t> sums;  // nr: the neighbors' sums of an iteration
+  thrust::device_vector<float> error;    // nr: GAP's error of an iteration
 
   void init() override {
     auto g = this->get_graph();
     auto n_vertices = g.get_number_of_vertices();
     plast.resize(n_vertices);
     iweights.resize(n_vertices);
+    if (pr_nr()) {
+      sums.resize(n_vertices);
+      error.resize(1);
+    }
   }
 
   void reset() override {
@@ -272,10 +302,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           return plast[G.get_destination_vertex(edge)];
         };
         auto plus_t = [] __host__ __device__(weight_t a, weight_t b) { return a + b; };
-        operators::neighborreduce::execute(G, E, p, edge_contrib, plus_t, weight_t(0), context);
+        weight_t* sums = P->sums.data().get();
+        operators::neighborreduce::execute(G, E, sums, edge_contrib, plus_t, weight_t(0), context);
         const weight_t base = weight_t((1 - alpha) / n_vertices);
-        thrust::transform(policy, p, p + n_vertices, p,
-                          [base] __host__ __device__(weight_t x) { return base + x; });
+        auto stream = this->context->get_context(0)->stream();
+        float* error = P->error.data().get();
+        cudaMemsetAsync(error, 0, sizeof(float), stream);
+        pr_finish_kernel<<<(unsigned int)((n_vertices + 255) / 256), 256, 0, stream>>>(
+            sums, p, (std::size_t)n_vertices, base, error);
         return;
       }
       if (pr_vertex()) {
@@ -361,6 +395,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       return true;
     auto G = P->get_graph();
     auto tol = P->param.tol;
+    if (pr_pull() && pr_nr() && P->param.max_iters > 0) {
+      // GAP: if (error < epsilon) break; with epsilon 0 (-t 0) never, so not read
+      if (tol <= 0)
+        return false;
+      float err = 0;
+      cudaMemcpy(&err, P->error.data().get(), sizeof(float), cudaMemcpyDeviceToHost);
+      return err < tol;
+    }
 
     auto n_vertices = G.get_number_of_vertices();
     auto p = P->result.p;
