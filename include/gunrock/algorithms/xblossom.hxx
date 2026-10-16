@@ -318,7 +318,8 @@ class engine_t {
   gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
 
-  gacge::task::stats_t task_all_, task_walk_, task_flip_;  // GACGE_TASK_STATS
+  gacge::task::stats_t task_all_, task_walk_, task_flip_, task_step_;  // GACGE_TASK_STATS
+  size_t blossom_step_{0};                                             // the blossom steps printed
   unsigned long long task_fe_{0};                          // the frontier edges of the run's advances
 
   // GACGE_XB_CLAIM: the augment step's tree claims. gap: XB-GAP's protocol (a
@@ -673,9 +674,11 @@ class engine_t {
       const bool count = count_;
       if (count) dev_blossoms_.SetH2D(0);
       auto blossoms_v = dev_blossoms_.DeviceView();
-      const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view();
+      const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view(),
+                                task_step = task_step_.view();
+      const unsigned long long fe_before = task_fe_;
       Advance([=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> bool {
-        const gacge::task::view_t t_all = task_all, t_walk = task_walk;
+        const gacge::task::view_t t_all = task_all, t_walk = task_walk, t_step = task_step;
         auto matching = matching_v;
         auto path_table = path_table_v;
         auto is_even = is_even_v;
@@ -700,11 +703,20 @@ class engine_t {
             len += path_table.LastSteps();
             gacge::task::record(t_all, len);
             gacge::task::record(t_walk, len);
+            gacge::task::record(t_step, len - 1);  // this step's walk: base walk + the two chain scans
           }
         }
         return false;
       });
       if (count) blossoms_ += dev_blossoms_.GetD2H();
+      if (gacge::task::enabled()) {  // one line per blossom step: its frontier edges, the closing ones' walks
+        const unsigned long long fe = task_fe_ - fe_before, closing = task_step_.tasks();
+        task_step_.add(fe > closing ? fe - closing : 0ULL, 0);  // the other edges: no walk
+        task_step_.print("X-Blossom", "blossom-step",
+                         "step=" + std::to_string(blossom_step_) + " frontier_e=" + std::to_string(fe) +
+                             " closing=" + std::to_string(closing));
+        blossom_step_++;
+      }
       const size_t num_tasks = blossom_offset_list_.size();
       CheckListFits(num_tasks, "odd-node task");
       peak_list_ = std::max(peak_list_, num_tasks);
