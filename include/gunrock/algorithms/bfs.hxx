@@ -206,7 +206,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // switching state, allocated by init(), set by reset(), outside the timing
   bool gap_dobfs() const { return param.direction_optimized && rule_gap(); }
   vertex_t* queue[2] = {nullptr, nullptr};
-  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
   gacge::lb::merge_t merge;  // merge-path: a step's prefix sum of edges and its merge tiles
   int cur = 0;
   unsigned long long queue_n = 0;

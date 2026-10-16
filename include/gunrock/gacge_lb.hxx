@@ -17,7 +17,9 @@
  *           7 units a thread, a block per merge tile; the merge tiles'
  *           coordinates from loops' generate_search_coordinates.
  *
- * GACGE_LB picks one for every primitive (each has its default). f(i, u, e)
+ * GACGE_LB picks one for every primitive (default merge, since 2026-10-16: on
+ * the eight graphs it was the fastest of the four or within 25% of it in 36
+ * of 40 primitive-graph cases, at worst 1.82x). f(i, u, e)
  * handles atom e of tile i (vertex u); true skips the rest of tile i's atoms
  * in that thread (group: in that group), e.g. BFS's bottom-up step at the first
  * neighbor in the front.

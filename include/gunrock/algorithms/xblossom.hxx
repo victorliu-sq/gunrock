@@ -404,7 +404,7 @@ class engine_t {
   void Advance(op_t op) {
     if (ts_on_) TraversalStep();
     if (gacge::lb::enabled()) {  // the schedule GACGE_LB of every GACGE primitive (gacge_lb.hxx)
-      gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::block), G_, op, input_frontier_.data(),
+      gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::merge), G_, op, input_frontier_.data(),
                          (long long)input_frontier_.get_number_of_elements(), lb_merge_,
                          context_->get_context(0)->stream());
       CUDA_CHECK(cudaGetLastError());

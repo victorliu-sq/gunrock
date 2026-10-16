@@ -207,7 +207,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   thrust::device_vector<unsigned long long> heavy_n;
   // tc_gap: the total, the schedule, and merge-path's prefix sum of the edges below each vertex
   thrust::device_vector<unsigned long long> gap_counters;
-  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);
   gacge::lb::merge_t merge;  // merge-path: the prefix sum of the edges below each vertex and its merge tiles (timed)
 
   void init() override {

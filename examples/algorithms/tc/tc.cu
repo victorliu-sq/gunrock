@@ -153,7 +153,7 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
   const edge_t* noff = thrust::raw_pointer_cast(out.row_offsets.data());
   const vertex_t* nid = thrust::raw_pointer_cast(new_ids.data());
   vertex_t* mc = thrust::raw_pointer_cast(mapped.data());
-  gacge::lb::dispatch(gacge::lb::mode(gacge::lb::mode_t::block), [&](auto tag) {
+  gacge::lb::dispatch(gacge::lb::mode(gacge::lb::mode_t::merge), [&](auto tag) {
     constexpr int Gs = decltype(tag)::value;
     if constexpr (Gs == 0) {  // merge-path over the row offsets (int: m < 2^31)
       static gacge::lb::merge_t merge;  // its buffers (allocated in the first, warm-up, run)
