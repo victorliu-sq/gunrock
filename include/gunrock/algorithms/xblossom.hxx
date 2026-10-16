@@ -36,6 +36,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 // X-Blossom's device structures (vendored; the example adds
 // include/gunrock/algorithms/xblossom to the include path).
@@ -308,6 +309,30 @@ class engine_t {
   gacge::lb::merge_t lb_merge_;  // -l gacge, merge-path's prefix sum and merge tiles (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
 
+  // GACGE_XB_CLAIM: the augment step's tree claims. gap: XB-GAP's protocol (a
+  // thread meeting a held tree gives up). tentative: a thread waits out a
+  // tentative holder of its first tree. tentative2 (default since 2026-10-16):
+  // of its second tree as well. On the eight graphs tentative2 cut the
+  // searches by 28-42% (a tree whose claimant lost the second lock is no
+  // longer left unpaired for the search); GACGE_XB_CLAIM_SPIN (default 64):
+  // the bound on each wait (types_gpu.h ClaimTreeWait).
+  static int ClaimMode() {
+    static const int m = [] {
+      const char* e = std::getenv("GACGE_XB_CLAIM");
+      if (e == nullptr) return 2;
+      const std::string s = e;
+      return s == "tentative2" ? 2 : s == "tentative" ? 1 : 0;
+    }();
+    return m;
+  }
+  static int ClaimSpin() {
+    static const int n = [] {
+      const char* e = std::getenv("GACGE_XB_CLAIM_SPIN");
+      return e ? std::atoi(e) : 64;
+    }();
+    return n;
+  }
+
   // GACGE_XB_PHASE_SYNC (default 1): a device synchronization at the end of
   // init, expand and blossom, so each phase's host-clock time holds its own
   // kernels (augment already ends with the found flag copied back). 0: no
@@ -487,6 +512,8 @@ class engine_t {
     if (LoadFrontier() == 0) return false;
     const index_t nnodes = nnodes_;
     const bool search_stats = SearchStats();
+    const int claim_mode = ClaimMode();
+    const int claim_spin = ClaimSpin();
     auto conflicts_v = dev_conflicts_.DeviceView();
     auto matching_v = dev_matching_.DeviceView();
     auto path_table_v = path_table_.DeviceView();
@@ -507,14 +534,31 @@ class engine_t {
       if (is_even[w] && root_v != root_w && root_v != nnodes && root_w != nnodes) {
         index_t first_lock = MIN(root_v, root_w);
         index_t second_lock = MAX(root_v, root_w);
-        if (!TryClaimDAtomicFlag(&locks[first_lock])) return false;  // XB-GAP's TryClaim, lower root first
-        if (!TryClaimDAtomicFlag(&locks[second_lock])) {
-          atomicExch(&locks[first_lock], DFLAG_FALSE);  // XB-GAP's release (an atomic store)
-          if (search_stats) atomicAdd(&conflicts_v, 1ULL);
-          return false;
-        }
-        path_table.AddAugmentingPath(v, w, matching);
-        atomicExch(&found, DFLAG_TRUE);
+        auto claim = [&]() {
+          if (claim_mode == 0) {  // XB-GAP's protocol
+            if (!TryClaimDAtomicFlag(&locks[first_lock])) return;  // XB-GAP's TryClaim, lower root first
+            if (!TryClaimDAtomicFlag(&locks[second_lock])) {
+              atomicExch(&locks[first_lock], DFLAG_FALSE);  // XB-GAP's release (an atomic store)
+              if (search_stats) atomicAdd(&conflicts_v, 1ULL);
+              return;
+            }
+          } else {  // tentative claims (types_gpu.h): wait out a tentative holder of the first tree,
+                    // and of the second too in mode 2 (the wait chain is increasing in root id)
+            if (!ClaimTreeWait(&locks[first_lock], claim_spin)) return;
+            const bool second = claim_mode == 2 ? ClaimTreeWait(&locks[second_lock], claim_spin)
+                                                : TryClaimDAtomicFlag(&locks[second_lock]);
+            if (!second) {
+              atomicExch(&locks[first_lock], DFLAG_FALSE);
+              if (search_stats) atomicAdd(&conflicts_v, 1ULL);
+              return;
+            }
+            atomicExch(&locks[first_lock], DFLAG_COMMITTED);
+            atomicExch(&locks[second_lock], DFLAG_COMMITTED);
+          }
+          path_table.AddAugmentingPath(v, w, matching);
+          atomicExch(&found, DFLAG_TRUE);
+        };
+        claim();
       }
       return false;
     });

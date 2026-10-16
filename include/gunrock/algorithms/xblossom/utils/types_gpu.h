@@ -12,6 +12,8 @@
 
 #define DFLAG_FALSE 0
 #define DFLAG_TRUE 1
+#define DFLAG_TENTATIVE 1  // GACGE tree claims: held while its holder tries the pair's other tree
+#define DFLAG_COMMITTED 2  // GACGE tree claims: both trees of a pair claimed; final for the search
 
 // Host-side pinned vector (accelerates H2D transfer)
 using MrPinned = thrust::system::cuda::universal_host_pinned_memory_resource;
@@ -71,6 +73,27 @@ __device__ __forceinline__ bool IsDAtomicFlagSet(DAtomicFlag *flag) {
 __device__ __forceinline__ bool TryClaimDAtomicFlag(DAtomicFlag *flag) {
   if (*reinterpret_cast<volatile DAtomicFlag *>(flag) != DFLAG_FALSE) return false;
   return atomicCAS(flag, DFLAG_FALSE, DFLAG_TRUE) == DFLAG_FALSE;
+}
+
+// GACGE (2026-10-16) tentative tree claims for the augment step. XB-GAP's
+// protocol holds a tree while trying the pair's other tree and releases it on
+// failure; a thread that meets the held tree gives up at once. On a CPU that
+// window is rarely hit; on a GPU, where the candidate edges of a frontier
+// run at once, it costs the tree its pairing for the search. Here the state
+// tells a tentative hold from a committed pair: a thread meeting a tentative
+// tree waits it out (bounded, __nanosleep backoff) and claims the tree if it
+// is released; a committed tree is final. Deadlock-free: a holder waits only
+// on trees of higher id (the pair's lower root is claimed first), so every
+// wait chain is strictly increasing and ends at a thread that holds nothing
+// or commits; and every wait is bounded by spin.
+__device__ __forceinline__ bool ClaimTreeWait(DAtomicFlag *flag, int spin) {
+  for (int i = 0;; ++i) {
+    const DAtomicFlag s = *reinterpret_cast<volatile DAtomicFlag *>(flag);
+    if (s == DFLAG_COMMITTED) return false;
+    if (s == DFLAG_FALSE && atomicCAS(flag, DFLAG_FALSE, DFLAG_TENTATIVE) == DFLAG_FALSE) return true;
+    if (i >= spin) return false;
+    __nanosleep(i < 6 ? (32u << i) : 1024u);
+  }
 }
 
 #endif //TYPES_GPU_H
