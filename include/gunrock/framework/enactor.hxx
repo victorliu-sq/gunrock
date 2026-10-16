@@ -12,6 +12,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #include <thrust/count.h>
 #include <thrust/execution_policy.h>
@@ -234,7 +235,7 @@ struct enactor_t {
    * @brief The active frontier's valid vertices and the edges they will
    * examine (the sum of their degrees), for GACGE_TRAVERSAL_STATS.
    */
-  void traversal_frontier_work(std::size_t& fv, std::size_t& fe, std::size_t& max_deg) {
+  virtual void traversal_frontier_work(std::size_t& fv, std::size_t& fe, std::size_t& max_deg) {
     // the operators run asynchronously on the context's stream: let the step finish first
     cudaDeviceSynchronize();
     auto f = get_input_frontier();
@@ -253,6 +254,13 @@ struct enactor_t {
     fv = thrust::count_if(thrust::device, first, first + n,
                           [] __device__(vertex_t const& v) { return gunrock::util::limits::is_valid(v); });
   }
+
+  /**
+   * @brief The edges the algorithm relaxed in the last enact() (its own
+   * count, e.g. sssp's delta-stepping with the bin fusion's edges), printed as
+   * XBTraversal's work_e for GACGE_TRAVERSAL_STATS; negative: not counted.
+   */
+  virtual long long traversal_work_e() { return -1; }
 
   /**
    * @brief Swap the inactive and active frontier buffers such that the inactive
@@ -308,11 +316,14 @@ struct enactor_t {
     finalize(*context);
     auto runtime = timer.end();
     gacge::profile::End();
-    if (stats)
+    if (stats) {
+      const long long work_e = traversal_work_e();
+      const std::string work = work_e >= 0 ? " work_e=" + std::to_string(work_e) : "";
       std::printf("XBTraversal: run=%d steps=%zu frontier_v=%zu frontier_e=%zu max_frontier_e=%zu small_steps=%zu "
-                  "imbalance=%.3f nodes=%zu edges=%zu\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,
+                  "imbalance=%.3f nodes=%zu edges=%zu%s\n", enact_index, t_steps, t_v, t_e, t_max_e, t_small,
                   t_imb_n ? t_imb / t_imb_n : 0.0, (std::size_t)problem->get_graph().get_number_of_vertices(),
-                  (std::size_t)problem->get_graph().get_number_of_edges());
+                  (std::size_t)problem->get_graph().get_number_of_edges(), work.c_str());
+    }
 #if (ESSENTIALS_COLLECT_METRICS)
     benchmark::____.search_depth = iteration;
     benchmark::____.total_runtime = runtime;
