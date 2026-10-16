@@ -10,9 +10,14 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/gacge_lb.hxx>
+
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/inner_product.h>
 #include <cub/block/block_reduce.cuh>
+#include <cub/block/block_scan.cuh>
 
 #include <cstdlib>
 #include <string>
@@ -37,7 +42,20 @@ inline bool pr_vertex() {
   return v;
 }
 
-// Default (or GACGE_PR=nr, since 2026-10-15): the pull with Gunrock's
+// Default (or GACGE_PR=gacge, since 2026-10-15): GAP's pull (pr_spmv), the
+// neighbors' contributions summed under the load balancing GACGE_LB
+// (gacge_lb.hxx, pr_sum_kernel; the only GPU-specific choice of every GACGE
+// primitive), then one pass sets base + sum and the error (pr_finish_kernel),
+// as GAP's loop.
+inline bool pr_gacge() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_PR");
+    return e == nullptr || std::string(e) == "gacge";
+  }();
+  return v;
+}
+
+// GACGE_PR=nr: the pull with Gunrock's
 // neighborreduce operator (as its spmv): each edge yields its neighbor's
 // contribution and a segmented reduction (moderngpu, merge-path balanced) sums
 // every vertex's edges, no atomics; 3.04x the CPU in geometric mean on the
@@ -46,7 +64,7 @@ inline bool pr_vertex() {
 inline bool pr_nr() {
   static const bool v = [] {
     const char* e = std::getenv("GACGE_PR");
-    return e == nullptr || std::string(e) == "nr";
+    return e != nullptr && std::string(e) == "nr";
   }();
   return v;
 }
@@ -127,6 +145,73 @@ __global__ void pr_finish_kernel(const weight_t* __restrict__ sums,
     atomicAdd(error, sum);
 }
 
+// every vertex with all its edges (the pull's items)
+template <typename graph_t>
+struct all_items_t {
+  using vertex_type = typename graph_t::vertex_type;
+  graph_t G;
+  __device__ void item(long long i, vertex_type& u, long long& start) const {
+    u = (vertex_type)i;
+    start = G.get_starting_edge(u);
+  }
+  __device__ long long len(long long i) const { return G.get_number_of_neighbors((vertex_type)i); }
+};
+
+// GAP's incoming_total of every vertex under the schedule Gs (gacge_lb.hxx):
+// thread-mapped: a thread sums its vertex; group-mapped: a group's threads
+// share its vertices' edges and add in shared memory; merge-path: a thread
+// adds its runs of a vertex's edges, then one atomic per run (sums zeroed
+// first). The row offsets are the merge path's prefix sum.
+template <int Gs, typename graph_t, typename weight_t>
+__global__ void __launch_bounds__(gacge::lb::kBlock)
+    pr_sum_kernel(graph_t G, const weight_t* __restrict__ contrib, weight_t* __restrict__ sums, int grain) {
+  using vertex_t = typename graph_t::vertex_type;
+  constexpr int kBlock = gacge::lb::kBlock;
+  const vertex_t n = G.get_number_of_vertices();
+  all_items_t<graph_t> items{G};
+  if constexpr (Gs == 1) {
+    const long long v = (long long)blockIdx.x * kBlock + threadIdx.x;
+    if (v < n) {
+      weight_t acc = 0;
+      for (auto e = G.get_starting_edge(v), last = G.get_starting_edge(v + 1); e < last; ++e)
+        acc += contrib[G.get_destination_vertex(e)];
+      sums[v] = acc;
+    }
+  } else if constexpr (Gs > 1) {
+    __shared__ weight_t s_sum[kBlock];
+    const long long first = (long long)blockIdx.x * kBlock;
+    s_sum[threadIdx.x] = 0;
+    __syncthreads();
+    gacge::lb::group_mapped<Gs>(items, n, [&](long long i, vertex_t, long long e) {
+      // the lanes of a warp on the same vertex add up first: one shared atomic per vertex and warp
+      namespace cg = cooperative_groups;
+      const int slot = (int)(i - first);
+      auto same = cg::labeled_partition(cg::coalesced_threads(), slot);
+      const weight_t part = cg::reduce(same, contrib[G.get_destination_vertex(e)], cg::plus<weight_t>());
+      if (same.thread_rank() == 0)
+        atomicAdd(s_sum + slot, part);
+      return false;
+    });
+    if (first + threadIdx.x < n)
+      sums[first + threadIdx.x] = s_sum[threadIdx.x];
+  } else {
+    vertex_t cur = gunrock::numeric_limits<vertex_t>::invalid();
+    weight_t acc = 0;
+    gacge::lb::merge_path(items, n, G.get_row_offsets(), grain, [&](long long, vertex_t v, long long e) {
+      if (v != cur) {
+        if (gunrock::util::limits::is_valid(cur))
+          atomicAdd(sums + cur, acc);
+        cur = v;
+        acc = 0;
+      }
+      acc += contrib[G.get_destination_vertex(e)];
+      return false;
+    });
+    if (gunrock::util::limits::is_valid(cur))
+      atomicAdd(sums + cur, acc);
+  }
+}
+
 template <typename weight_t>
 struct param_t {
   weight_t alpha;
@@ -165,18 +250,20 @@ struct problem_t : gunrock::problem_t<graph_t> {
   thrust::device_vector<weight_t>
       iweights;  // alpha * 1 / (sum of outgoing weights) -- used to determine
                  // out of mass spread from src to dst
-  thrust::device_vector<weight_t> sums;  // nr: the neighbors' sums of an iteration
-  thrust::device_vector<float> error;    // nr: GAP's error of an iteration
+  thrust::device_vector<weight_t> sums;  // nr, gacge: the neighbors' sums of an iteration
+  thrust::device_vector<float> error;    // nr, gacge: GAP's error of an iteration
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::merge);  // gacge
 
   void init() override {
     auto g = this->get_graph();
     auto n_vertices = g.get_number_of_vertices();
     plast.resize(n_vertices);
     iweights.resize(n_vertices);
-    if (pr_nr()) {
+    if (pr_nr() || pr_gacge()) {
       sums.resize(n_vertices);
       error.resize(1);
     }
+
   }
 
   void reset() override {
@@ -297,6 +384,23 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
               context);
         return;
       }
+      if (pr_gacge()) {
+        auto stream = this->context->get_context(0)->stream();
+        weight_t* sums = P->sums.data().get();
+        const weight_t base = weight_t((1 - alpha) / n_vertices);
+        float* error = P->error.data().get();
+        const unsigned int blocks = (unsigned int)(((long long)n_vertices + 255) / 256);
+        gacge::lb::dispatch(P->lb, [&](auto tag) {
+          constexpr int Gs = decltype(tag)::value;
+          if constexpr (Gs == 0)
+            cudaMemsetAsync(sums, 0, n_vertices * sizeof(weight_t), stream);
+          pr_sum_kernel<Gs><<<gacge::lb::grid<Gs>(n_vertices), gacge::lb::kBlock, 0, stream>>>(G, plast, sums,
+                                                                                            gacge::lb::grain());
+        });
+        cudaMemsetAsync(error, 0, sizeof(float), stream);
+        pr_finish_kernel<<<blocks, 256, 0, stream>>>(sums, p, (std::size_t)n_vertices, base, error);
+        return;
+      }
       if (pr_nr()) {
         auto edge_contrib = [G, plast] __host__ __device__(edge_t edge) -> weight_t {
           return plast[G.get_destination_vertex(edge)];
@@ -385,6 +489,12 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     // <<
   }
 
+  // the kernels run asynchronously on the context's stream, and the enactor's
+  // timer records on the default stream: wait for them before it stops
+  void finalize(gcuda::multi_context_t& context) override {
+    cudaStreamSynchronize(this->context->get_context(0)->stream());
+  }
+
   virtual bool is_converged(gcuda::multi_context_t& context) {
     if (this->iteration == 0)
       return false;
@@ -395,7 +505,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       return true;
     auto G = P->get_graph();
     auto tol = P->param.tol;
-    if (pr_pull() && pr_nr() && P->param.max_iters > 0) {
+    if (pr_pull() && (pr_nr() || pr_gacge()) && P->param.max_iters > 0) {
       // GAP: if (error < epsilon) break; with epsilon 0 (-t 0) never, so not read
       if (tol <= 0)
         return false;

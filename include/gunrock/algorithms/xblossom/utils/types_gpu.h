@@ -66,4 +66,11 @@ __device__ __forceinline__ bool IsDAtomicFlagSet(DAtomicFlag *flag) {
   return *flag == DFLAG_TRUE;
 }
 
+// XB-GAP's TryClaim: a plain load first, the compare-and-swap only on a free
+// flag (test-and-test-and-set); volatile, so the load is not an L1 copy
+__device__ __forceinline__ bool TryClaimDAtomicFlag(DAtomicFlag *flag) {
+  if (*reinterpret_cast<volatile DAtomicFlag *>(flag) != DFLAG_FALSE) return false;
+  return atomicCAS(flag, DFLAG_FALSE, DFLAG_TRUE) == DFLAG_FALSE;
+}
+
 #endif //TYPES_GPU_H

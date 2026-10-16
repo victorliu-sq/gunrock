@@ -7,6 +7,7 @@
 #include <cxxopts.hpp>
 
 #include <cub/block/block_scan.cuh>
+#include <gunrock/gacge_lb.hxx>
 #include <cub/device/device_segmented_sort.cuh>
 #include <thrust/binary_search.h>
 #include <thrust/scan.h>
@@ -91,44 +92,29 @@ bool gap_worth_relabelling(const std::vector<edge_t>& off) {
   return sample_average / 1.3 > sample_median;
 }
 
-// RelabelByDegree's list mapping (GAP: each vertex writes its neighbors' new
-// ids into its new list): a block takes 256 vertices and its threads share
-// their edges (degrees scanned in the block), no search per edge.
+// every vertex of the input with all its edges (RelabelByDegree's mapping)
 template <typename vertex_t, typename edge_t>
-__global__ void __launch_bounds__(256) relabel_map_kernel(const edge_t* off, const vertex_t* col,
-                                                          const edge_t* noff, const vertex_t* nid,
-                                                          vertex_t* mc, vertex_t n) {
-  using scan_t = cub::BlockScan<long long, 256>;
-  __shared__ typename scan_t::TempStorage temp;
-  __shared__ long long s_off[256];
-  __shared__ vertex_t s_u[256];
-  const int t = threadIdx.x;
-  const long long first = (long long)blockIdx.x * 256;
-  const int k = (int)min((long long)256, (long long)n - first);
-  long long deg = 0;
-  if (t < k) {
-    const vertex_t u = (vertex_t)(first + t);
-    s_u[t] = u;
-    deg = (long long)(off[u + 1] - off[u]);
+struct csr_tiles_t {
+  using vertex_type = vertex_t;
+  const edge_t* off;
+  __device__ void item(long long i, vertex_t& u, long long& start) const {
+    u = (vertex_t)i;
+    start = off[i];
   }
-  long long o, total;
-  scan_t(temp).ExclusiveSum(deg, o, total);
-  if (t < k)
-    s_off[t] = o;
-  __syncthreads();
-  for (long long i = t; i < total; i += 256) {
-    int lo = 0, hi = k - 1;
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (s_off[mid] <= i)
-        lo = mid;
-      else
-        hi = mid - 1;
-    }
-    const vertex_t u = s_u[lo];
-    const long long j = i - s_off[lo];
-    mc[noff[nid[u]] + j] = nid[col[off[u] + j]];
-  }
+  __device__ long long len(long long i) const { return (long long)(off[i + 1] - off[i]); }
+};
+
+// RelabelByDegree's list mapping (GAP: each vertex writes its neighbors' new
+// ids into its new list), the edges spread by the schedule GACGE_LB
+// (gacge_lb.hxx); merge-path's prefix sum is the row offsets
+template <int Gs, typename vertex_t, typename edge_t>
+__global__ void __launch_bounds__(256) relabel_map_kernel(const edge_t* off, const vertex_t* col, const edge_t* noff,
+                                                          const vertex_t* nid, vertex_t* mc, vertex_t n, int grain) {
+  csr_tiles_t<vertex_t, edge_t> tiles{off};
+  gacge::lb::for_edges<Gs>(tiles, (long long)n, off, grain, [&](long long, vertex_t u, long long e) {
+    mc[noff[nid[u]] + (e - off[u])] = nid[col[e]];
+    return false;
+  });
 }
 
 // GAP's RelabelByDegree on the device: vertices sorted by (degree, id),
@@ -166,7 +152,10 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
   const edge_t* noff = thrust::raw_pointer_cast(out.row_offsets.data());
   const vertex_t* nid = thrust::raw_pointer_cast(new_ids.data());
   vertex_t* mc = thrust::raw_pointer_cast(mapped.data());
-  relabel_map_kernel<<<(unsigned int)(((long long)n + 255) / 256), 256>>>(off, col, noff, nid, mc, n);
+  gacge::lb::dispatch(gacge::lb::mode(gacge::lb::mode_t::block), [&](auto tag) {
+    constexpr int Gs = decltype(tag)::value;
+    relabel_map_kernel<Gs><<<gacge::lb::grid<Gs>(n), 256>>>(off, col, noff, nid, mc, n, gacge::lb::grain());
+  });
   std::size_t temp_bytes = 0;
   vertex_t* oc = thrust::raw_pointer_cast(out.column_indices.data());
   cub::DeviceSegmentedSort::SortKeys(nullptr, temp_bytes, mc, oc, (int64_t)m, (int64_t)n, noff, noff + 1);

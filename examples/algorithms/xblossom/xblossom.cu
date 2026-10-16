@@ -204,6 +204,11 @@ int main(int argc, char** argv) {
   using table_t = zblossom::dev::PathTable;
   using tuple_t = zblossom::dev::TuplePathTable;
   const bool tuple = o.table == "compact";
+  if (o.lb == "gacge") {  // gacge_lb.hxx: the schedule GACGE_LB (thread, warp, group, block, merge)
+    gacge::lb::enabled() = true;
+    return tuple ? run<operators::load_balance_t::block_mapped, tuple_t>(G, o, row, col)
+                 : run<operators::load_balance_t::block_mapped, table_t>(G, o, row, col);
+  }
   if (o.lb == "block")
     return tuple ? run<operators::load_balance_t::block_mapped, tuple_t>(G, o, row, col)
                  : run<operators::load_balance_t::block_mapped, table_t>(G, o, row, col);
@@ -213,6 +218,6 @@ int main(int argc, char** argv) {
   if (o.lb == "merge")  // merge_path: Gunrock's edge-balanced advance (moderngpu load-balancing search)
     return tuple ? run<operators::load_balance_t::merge_path, tuple_t>(G, o, row, col)
                  : run<operators::load_balance_t::merge_path, table_t>(G, o, row, col);
-  std::fprintf(stderr, "-l must be block, thread or merge\n");
+  std::fprintf(stderr, "-l must be gacge, block, thread or merge\n");
   return 2;
 }

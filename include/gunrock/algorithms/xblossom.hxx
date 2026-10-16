@@ -27,6 +27,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/gacge_lb.hxx>
 
 #include <cub/cub.cuh>
 #include <thrust/functional.h>
@@ -71,7 +72,7 @@ __device__ __forceinline__ void ClaimOddNodesOnChain(path_table_t& path_table, f
                                                      array_t& task_s, array_t& task_o, array_t& task_base,
                                                      index_t s, index_t o, index_t base) {
   path_table.ForEachRecordedOddOnChain(s, base, [&](index_t n) {
-    if (!is_even[n] && atomicExch(&atomic_locks_odd_nodes[n], DFLAG_TRUE) == DFLAG_FALSE) {
+    if (!is_even[n] && TryClaimDAtomicFlag(&atomic_locks_odd_nodes[n])) {  // XB-GAP's TryClaim
       const offset_t t = task_node.Append(n);
       if (static_cast<size_t>(t) >= task_node.capacity()) return; // the list is full; the host stops the run
       task_s[t] = s;
@@ -132,6 +133,8 @@ class engine_t {
                                              cuda_stream_.cuda_stream()));
     scan_temp_.resize(bytes);
     scan_temp_bytes_ = bytes;
+    if (gacge::lb::enabled())
+      lb_offsets_.reserve(nnodes_);
   }
 
   // entries of a blossom list: ratio x n, rounded up, plus the one a prefix sum needs
@@ -300,6 +303,7 @@ class engine_t {
 
   frontier_t input_frontier_;
   frontier_t output_frontier_;  // unused: the advances write no output frontier
+  gacge::lb::offsets_t lb_offsets_;  // -l gacge, merge-path's prefix sum (gacge_lb.hxx)
   thrust::device_vector<edge_t> segments_;
 
   // GACGE_XB_PHASE_SYNC (default 1): a device synchronization at the end of
@@ -397,6 +401,14 @@ class engine_t {
   template <typename op_t>
   void Advance(op_t op) {
     if (ts_on_) TraversalStep();
+    if (gacge::lb::enabled()) {  // the schedule GACGE_LB of every GACGE primitive (gacge_lb.hxx)
+      gacge::lb::advance(gacge::lb::mode(gacge::lb::mode_t::block), G_, op, input_frontier_.data(),
+                         (long long)input_frontier_.get_number_of_elements(), lb_offsets_,
+                         context_->get_context(0)->stream());
+      CUDA_CHECK(cudaGetLastError());
+      CUDA_CHECK(cudaDeviceSynchronize());
+      return;
+    }
     operators::advance::execute<LB, operators::advance_direction_t::forward,
                                 operators::advance_io_type_t::vertices, operators::advance_io_type_t::none>(
         G_, op, &input_frontier_, &output_frontier_, segments_, *context_);
@@ -493,9 +505,9 @@ class engine_t {
       if (is_even[w] && root_v != root_w && root_v != nnodes && root_w != nnodes) {
         index_t first_lock = MIN(root_v, root_w);
         index_t second_lock = MAX(root_v, root_w);
-        if (atomicExch(&locks[first_lock], DFLAG_TRUE) != DFLAG_FALSE) return false;
-        if (atomicExch(&locks[second_lock], DFLAG_TRUE) != DFLAG_FALSE) {
-          locks[first_lock] = DFLAG_FALSE;
+        if (!TryClaimDAtomicFlag(&locks[first_lock])) return false;  // XB-GAP's TryClaim, lower root first
+        if (!TryClaimDAtomicFlag(&locks[second_lock])) {
+          atomicExch(&locks[first_lock], DFLAG_FALSE);  // XB-GAP's release (an atomic store)
           if (search_stats) atomicAdd(&conflicts_v, 1ULL);
           return false;
         }
@@ -533,7 +545,7 @@ class engine_t {
       if (root_w == nnodes) {
         index_t x = matching[w];
         index_t match_idx = MIN(w, x);
-        if (atomicExch(&locks[match_idx], DFLAG_TRUE) == DFLAG_FALSE) {
+        if (TryClaimDAtomicFlag(&locks[match_idx])) {  // XB-GAP's TryClaim
           is_even[w] = 0;
           is_even[x] = 1;
           tree_roots[w] = root_v;

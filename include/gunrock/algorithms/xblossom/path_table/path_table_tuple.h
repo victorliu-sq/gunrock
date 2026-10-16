@@ -41,7 +41,7 @@
 #include "utils/cpp_types.h"
 #include "utils/dev_list.h"
 
-#define XB_TUPLE_FLIP_STACK 64
+#define XB_TUPLE_FLIP_STACK 256  // XB-GAP's depth
 #define XB_TUPLE_CYCLE_STACK 128
 
 namespace zblossom {
@@ -339,7 +339,10 @@ namespace zblossom {
               flips++;
               cur.x = r.b;
             } else {
-              assert(depth < XB_TUPLE_FLIP_STACK);
+              if (depth >= XB_TUPLE_FLIP_STACK) {  // XB-GAP aborts: mark the run (peak past the stack)
+                atomicMax(&flip_stack_peak_, XB_TUPLE_FLIP_STACK + 1);
+                return;
+              }
               stack[depth++] = Walk{r.b, cur.stop};
               if (depth > peak) peak = depth;
               Flip(r.a, r.b, matching);

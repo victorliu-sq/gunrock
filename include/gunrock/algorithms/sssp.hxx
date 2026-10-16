@@ -10,6 +10,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/gacge_lb.hxx>
 
 #include <cooperative_groups.h>
 #include <cub/block/block_scan.cuh>
@@ -43,7 +44,9 @@ namespace sssp {
 //    lowest non-empty bin, taken whole (no copy).
 // A relaxation from bin b lands at most max weight / delta + 1 bins ahead, so
 // the bins are a ring of max weight / delta + 3 buffers; one kernel and one
-// read of the bin sizes per step. bf: Gunrock's frontier Bellman-Ford (every
+// read of the bin sizes per step. The step's edges are spread by the load
+// balancing GACGE_LB (gacge_lb.hxx: thread, block or merge; the only GPU-specific
+// choice of every GACGE primitive). bf: Gunrock's frontier Bellman-Ford (every
 // improved vertex is in the next frontier).
 inline bool sssp_delta() {
   static const bool v = [] {
@@ -128,87 +131,83 @@ __device__ bool relax(weight_t* dist, vertex_t v, weight_t nd) {
   return false;
 }
 
-template <typename vertex_t, typename edge_t>
-struct block_shared_t {
-  typename cub::BlockScan<long long, kBlock>::TempStorage scan;
+template <typename vertex_t>
+struct fusion_shared_t {
   vertex_t u[kBlock];
-  edge_t start[kBlock];
-  long long off[kBlock];
   vertex_t queue[kQueue];             // the block's current-bin vertices
   vertex_t fused[kBinSizeThreshold];  // the ones a fusion round relaxes
   int queued;                         // may exceed kQueue: the rest went to slot R
 };
 
-// Relax the out-edges of the k vertices in sh.u (block-mapped: the block's
-// threads share the chunk's edges); new current-bin vertices go to the
-// block's queue while fusing, the others to their bins.
-template <typename graph_t, typename vertex_t, typename edge_t, typename weight_t>
-__device__ void relax_chunk(graph_t& G,
-                            const step_t<vertex_t, weight_t>& p,
-                            block_shared_t<vertex_t, edge_t>& sh,
-                            int k) {
-  const int t = threadIdx.x;
-  long long deg = 0;
-  edge_t start = 0;
-  if (t < k) {
-    const vertex_t u = sh.u[t];
-    if (p.dist[u] >= p.delta * (weight_t)p.bin) {  // GAP: skip a stale entry
-      start = G.get_starting_edge(u);
-      deg = G.get_number_of_neighbors(u);
-    }
-  }
-  long long off, total;
-  cub::BlockScan<long long, kBlock>(sh.scan).ExclusiveSum(deg, off, total);
-  if (t < k) {
-    sh.off[t] = off;
-    sh.start[t] = start;
-  }
-  __syncthreads();
-  if (p.work && t == 0 && total > 0)
-    atomicAdd(p.work, (unsigned long long)total);
-  for (long long i = t; i < total; i += kBlock) {
-    int lo = 0, hi = k - 1;  // the last vertex whose edges start at or before i
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (sh.off[mid] <= i)
-        lo = mid;
-      else
-        hi = mid - 1;
-    }
-    const vertex_t u = sh.u[lo];
-    const edge_t e = sh.start[lo] + (edge_t)(i - sh.off[lo]);
-    const vertex_t v = G.get_destination_vertex(e);
-    const weight_t nd = p.dist[u] + G.get_edge_weight(e);
-    if (relax(p.dist, v, nd)) {
-      const long long b = (long long)(nd / p.delta);
-      if (b == p.bin && p.fuse) {
-        const int q = atomicAdd(&sh.queued, 1);
-        if (q < kQueue) {
-          sh.queue[q] = v;
-          continue;
-        }
+// GAP's RelaxEdges for one edge: a new current-bin vertex goes to the
+// block's queue while fusing, any other to its bin
+template <typename graph_t, typename vertex_t, typename weight_t>
+__device__ __forceinline__ void relax_edge(const graph_t& G, const step_t<vertex_t, weight_t>& p,
+                                           fusion_shared_t<vertex_t>& sh, vertex_t u, long long e) {
+  const vertex_t v = G.get_destination_vertex(e);
+  const weight_t nd = p.dist[u] + G.get_edge_weight(e);
+  if (relax(p.dist, v, nd)) {
+    const long long b = (long long)(nd / p.delta);
+    if (b == p.bin && p.fuse) {
+      const int q = atomicAdd(&sh.queued, 1);
+      if (q < kQueue) {
+        sh.queue[q] = v;
+        return;
       }
-      append(p, p.slot(b), v);
     }
+    append(p, p.slot(b), v);
   }
-  __syncthreads();
 }
 
-// One step: each block takes kBlock frontier entries (GAP: dynamic chunks of
-// 64 per thread), then fuses its own current bin.
-template <typename graph_t, typename vertex_t, typename edge_t, typename weight_t>
+// the step's items: frontier entries, a stale one (its distance dropped below
+// the bin, GAP's check) with no edges
+template <typename graph_t, typename weight_t>
+struct step_items_t {
+  using vertex_type = typename graph_t::vertex_type;
+  graph_t G;
+  const vertex_type* frontier;
+  const weight_t* dist;
+  weight_t floor_d;
+  __device__ void item(long long i, vertex_type& u, long long& start) const {
+    u = frontier[i];
+    start = G.get_starting_edge(u);
+  }
+  __device__ long long len(long long i) const {
+    const vertex_type u = frontier[i];
+    return dist[u] >= floor_d ? (long long)G.get_number_of_neighbors(u) : 0;
+  }
+};
+
+template <typename value_t>
+__device__ __forceinline__ void block_add(value_t x, unsigned long long* to) {
+  using reduce_t = cub::BlockReduce<unsigned long long, kBlock>;
+  __shared__ typename reduce_t::TempStorage temp;
+  const unsigned long long sum = reduce_t(temp).Sum((unsigned long long)x);
+  if (threadIdx.x == 0 && sum)
+    atomicAdd(to, sum);
+}
+
+// One step under the schedule Gs (gacge_lb.hxx), then GAP's bin fusion: a
+// block (GAP's thread) relaxes its own current-bin vertices at once while
+// fewer than 1000, a round's vertices spread as the step's (thread-mapped: one
+// per thread; group-mapped: by its groups; merge-path: by the block).
+template <int Gs, typename graph_t, typename vertex_t, typename weight_t>
 __global__ void __launch_bounds__(kBlock)
-    step_kernel(graph_t G, step_t<vertex_t, weight_t> p, const vertex_t* front, unsigned long long n) {
-  __shared__ block_shared_t<vertex_t, edge_t> sh;
+    step_kernel(graph_t G, step_t<vertex_t, weight_t> p, step_items_t<graph_t, weight_t> items, long long n,
+                const unsigned long long* offsets, int grain) {
+  __shared__ fusion_shared_t<vertex_t> sh;
   const int t = threadIdx.x;
   if (t == 0)
     sh.queued = 0;
-  const unsigned long long first = (unsigned long long)blockIdx.x * kBlock;
-  const int k = (int)min((unsigned long long)kBlock, n - first);
-  if (t < k)
-    sh.u[t] = front[first + t];
   __syncthreads();
-  relax_chunk(G, p, sh, k);
+  unsigned long long work = 0;
+  auto f = [&](long long, vertex_t u, long long e) {
+    work++;
+    relax_edge(G, p, sh, u, e);
+    return false;
+  };
+  gacge::lb::for_edges<Gs>(items, n, offsets, grain, f);
+  __syncthreads();
   // GAP's bin fusion: while the local current bin is non-empty and below the threshold
   while (p.fuse) {
     const int m = sh.queued;
@@ -227,12 +226,26 @@ __global__ void __launch_bounds__(kBlock)
     __syncthreads();
     for (int c = 0; c < m; c += kBlock) {
       const int kk = min(kBlock, m - c);
-      if (t < kk)
-        sh.u[t] = sh.fused[c + t];
+      step_items_t<graph_t, weight_t> round{G, sh.fused + c, p.dist, items.floor_d};
+      if constexpr (Gs == 1) {
+        if (t < kk) {
+          vertex_t u;
+          long long start;
+          round.item(t, u, start);
+          const long long last = start + round.len(t);
+          for (long long e = start; e < last; ++e)
+            f(t, u, e);
+        }
+      } else {
+        // the round's groups share its edges (merge-path: the whole block, one group)
+        __syncthreads();
+        gacge::lb::group_tiles<Gs == 0 ? gacge::lb::kBlock : Gs>(round, 0, kk, f);
+      }
       __syncthreads();
-      relax_chunk(G, p, sh, kk);
     }
   }
+  if (p.work)
+    block_add(work, p.work);
 }
 
 // after growing the overflowed slots: the marked vertices join the bin of their distance
@@ -294,6 +307,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long* h_desc = nullptr;  // pinned
   uint8_t* marked = nullptr;
   unsigned long long* d_work = nullptr;
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
+  gacge::lb::offsets_t offsets;  // merge: the step's prefix sum of edges
 
   cudaStream_t stream() { return this->context->get_context(0)->stream(); }
   std::size_t desc_size() const { return 3 * (std::size_t)(R + 1) + 1; }
@@ -361,6 +376,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
     cudaMemsetAsync(marked, 0, n, stream());
     if (std::getenv("GACGE_TRAVERSAL_STATS"))
       cudaMallocAsync(&d_work, sizeof(unsigned long long), stream());
+    if (lb == gacge::lb::mode_t::merge)
+      offsets.reserve(cap);
   }
 
   void reset() override {
@@ -506,9 +523,18 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
 
     if (sssp_delta()) {
       const int R = P->R;
-      const unsigned long long blocks = (P->front_n + delta::kBlock - 1) / delta::kBlock;
-      delta::step_kernel<decltype(G), vertex_t, edge_t, weight_t>
-          <<<(unsigned int)blocks, delta::kBlock, 0, P->stream()>>>(G, P->step(), P->front.first, P->front_n);
+      const long long n = (long long)P->front_n;
+      delta::step_items_t<decltype(G), weight_t> items{G, P->front.first, P->result.distances,
+                                                       P->delta_w * (weight_t)P->bin};
+      gacge::lb::dispatch(P->lb, [&](auto tag) {
+        constexpr int Gs = decltype(tag)::value;
+        if constexpr (Gs == 0) {
+          P->offsets.reserve(n);
+          gacge::lb::prefix(items, n, P->offsets.data, P->stream());
+        }
+        delta::step_kernel<Gs><<<gacge::lb::grid<Gs>(n), delta::kBlock, 0, P->stream()>>>(
+            G, P->step(), items, n, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain());
+      });
       P->download_tails();
       P->recover_overflow();
       // the next frontier: the current bin again, else the lowest non-empty bin

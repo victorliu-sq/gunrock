@@ -10,6 +10,7 @@
 #pragma once
 
 #include <gunrock/algorithms/algorithms.hxx>
+#include <gunrock/gacge_lb.hxx>
 
 #include <cooperative_groups.h>
 #include <cub/block/block_reduce.cuh>
@@ -44,23 +45,16 @@ inline bool rule_gap() {
 // into the scout count; a bottom-up step (BUStep) lets every unvisited vertex
 // scan its neighbors for one in the front bitmap, sets its bit in the next
 // bitmap and counts it awake. QueueToBitmap / BitmapToQueue convert at the
-// switches. One kernel and one read of the counters per step.
+// switches. One read of the counters per step.
 namespace gap {
 
-constexpr int kBlock = 256;
+constexpr int kBlock = gacge::lb::kBlock;
 constexpr int kAlpha = 15, kBeta = 18;  // GAP's defaults
-// A GPU thread scans a vertex as GAP's thread does, but a long list would
-// stall its warp (block): a bottom-up vertex of more than GACGE_BFS_WARP
-// (default 128) neighbors is scanned by its warp, 32 at a time, still stopping
-// at the first in the front; a top-down vertex of more than GACGE_BFS_HEAVY
-// (default 2048) is spread over the grid (td_heavy_kernel). The defaults: the
-// best on the eight graphs together (Arabic: 158 ms without, 77 ms with).
-inline long long env_ll(const char* name, long long def) {
-  const char* e = std::getenv(name);
-  return e ? std::atoll(e) : def;
-}
-inline long long warp_scan() { static const long long v = env_ll("GACGE_BFS_WARP", 128); return v; }
-inline long long heavy_deg() { static const long long v = env_ll("GACGE_BFS_HEAVY", 2048); return v; }
+// Both steps' edges are spread by the load balancing GACGE_LB (gacge_lb.hxx:
+// thread, block or merge; the only GPU-specific choice of every GACGE
+// primitive). A bottom-up vertex stops at its first neighbor in the front, as
+// GAP's: its thread breaks (thread), its block skips its other edges (block),
+// and any thread skips its edges once its distance is set (all three).
 
 __device__ __forceinline__ bool get_bit(const uint32_t* bm, long long v) {
   return (bm[v >> 5] >> (v & 31)) & 1u;
@@ -81,145 +75,75 @@ __device__ void push_back(vertex_t* q, unsigned long long* tail, vertex_t v) {
   q[base + g.thread_rank()] = v;
 }
 
-// counters: [0] the next queue's length, [1] the scout count, [2] the awake
-// count, [3] the heavy top-down vertices this step (heavy[])
-template <typename graph_t, typename vertex_t>
-__global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, vertex_t level,
-                                                    const vertex_t* queue, unsigned long long n,
-                                                    vertex_t* next, unsigned long long* counters,
-                                                    vertex_t* heavy, long long kHeavy) {
-  using edge_t = typename graph_t::edge_type;
-  using scan_t = cub::BlockScan<long long, kBlock>;
-  using reduce_t = cub::BlockReduce<unsigned long long, kBlock>;
-  __shared__ union {
-    typename scan_t::TempStorage scan;
-    typename reduce_t::TempStorage reduce;
-  } temp;
-  __shared__ vertex_t s_u[kBlock];
-  __shared__ edge_t s_start[kBlock];
-  __shared__ long long s_off[kBlock];
-  const int t = threadIdx.x;
-  const unsigned long long first = (unsigned long long)blockIdx.x * kBlock;
-  const int k = (int)min((unsigned long long)kBlock, n - first);
-  long long deg = 0;
-  edge_t start = 0;
-  if (t < k) {
-    const vertex_t u = queue[first + t];
-    s_u[t] = u;
-    start = G.get_starting_edge(u);
-    deg = G.get_number_of_neighbors(u);
-    if (deg > kHeavy) {  // td_heavy_kernel
-      heavy[atomicAdd(counters + 3, 1ULL)] = u;
-      deg = 0;
-    }
-  }
-  long long off, total;
-  scan_t(temp.scan).ExclusiveSum(deg, off, total);
-  if (t < k) {
-    s_off[t] = off;
-    s_start[t] = start;
-  }
-  __syncthreads();
+// GAP's claim: a load, then a compare-and-swap only while unvisited
+template <typename vertex_t>
+__device__ __forceinline__ bool claim(vertex_t* dist, vertex_t v, vertex_t level) {
   const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
+  return dist[v] == unvisited && atomicCAS(dist + v, unvisited, level + 1) == unvisited;
+}
+
+template <typename value_t>
+__device__ __forceinline__ void block_add(value_t x, unsigned long long* to) {
+  using reduce_t = cub::BlockReduce<unsigned long long, kBlock>;
+  __shared__ typename reduce_t::TempStorage temp;
+  const unsigned long long sum = reduce_t(temp).Sum((unsigned long long)x);
+  if (threadIdx.x == 0 && sum)
+    atomicAdd(to, sum);
+}
+
+// every vertex, an unvisited one with its edges (GAP's BUStep: parent[u] < 0)
+template <typename graph_t>
+struct bu_items_t {
+  using vertex_type = typename graph_t::vertex_type;
+  graph_t G;
+  const vertex_type* dist;
+  __device__ void item(long long i, vertex_type& u, long long& start) const {
+    u = (vertex_type)i;
+    start = G.get_starting_edge(u);
+  }
+  __device__ long long len(long long i) const {
+    return dist[i] == std::numeric_limits<vertex_type>::max() ? (long long)G.get_number_of_neighbors((vertex_type)i) : 0;
+  }
+};
+
+// counters: [0] the next queue's length, [1] the scout count, [2] the awake count
+template <int Gs, typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, vertex_t level,
+                                                    gacge::lb::frontier_tiles_t<graph_t> items, long long n,
+                                                    const unsigned long long* offsets, int grain, vertex_t* next,
+                                                    unsigned long long* counters) {
   unsigned long long scout = 0;
-  for (long long i = t; i < total; i += kBlock) {  // block-mapped: the chunk's edges over the block
-    int lo = 0, hi = k - 1;
-    while (lo < hi) {
-      const int mid = (lo + hi + 1) >> 1;
-      if (s_off[mid] <= i)
-        lo = mid;
-      else
-        hi = mid - 1;
-    }
-    const vertex_t v = G.get_destination_vertex(s_start[lo] + (edge_t)(i - s_off[lo]));
-    if (dist[v] == unvisited && atomicCAS(dist + v, unvisited, level + 1) == unvisited) {
+  gacge::lb::for_edges<Gs>(items, n, offsets, grain, [&](long long, vertex_t, long long e) {
+    const vertex_t v = G.get_destination_vertex(e);
+    if (claim(dist, v, level)) {
       push_back(next, counters + 0, v);
       scout += G.get_number_of_neighbors(v);  // GAP: scout_count += -curr_val, v's degree
     }
-  }
-  __syncthreads();
-  const unsigned long long sum = reduce_t(temp.reduce).Sum(scout);
-  if (t == 0 && sum)
-    atomicAdd(counters + 1, sum);
+    return false;
+  });
+  block_add(scout, counters + 1);
 }
 
-// the heavy vertices' edges over the whole grid
-template <typename graph_t, typename vertex_t>
-__global__ void __launch_bounds__(kBlock) td_heavy_kernel(graph_t G, vertex_t* dist, vertex_t level,
-                                                          vertex_t* next, unsigned long long* counters,
-                                                          const vertex_t* heavy) {
-  using reduce_t = cub::BlockReduce<unsigned long long, kBlock>;
-  __shared__ typename reduce_t::TempStorage temp;
-  const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
-  const unsigned long long nh = counters[3];
-  const long long gid = (long long)blockIdx.x * kBlock + threadIdx.x;
-  const long long stride = (long long)gridDim.x * kBlock;
-  unsigned long long scout = 0;
-  for (unsigned long long h = 0; h < nh; h++) {
-    const vertex_t u = heavy[h];
-    const auto first = G.get_starting_edge(u), last = G.get_starting_edge(u + 1);
-    for (long long e = first + gid; e < last; e += stride) {
-      const vertex_t v = G.get_destination_vertex(e);
-      if (dist[v] == unvisited && atomicCAS(dist + v, unvisited, level + 1) == unvisited) {
-        push_back(next, counters + 0, v);
-        scout += G.get_number_of_neighbors(v);
-      }
-    }
-  }
-  const unsigned long long sum = reduce_t(temp).Sum(scout);
-  if (threadIdx.x == 0 && sum)
-    atomicAdd(counters + 1, sum);
-}
-
-template <typename graph_t, typename vertex_t>
-__global__ void __launch_bounds__(kBlock) bu_kernel(graph_t G, vertex_t* dist, vertex_t level,
-                                                    const uint32_t* front, uint32_t* next, vertex_t n,
-                                                    unsigned long long* counters, long long kWarpScan) {
-  using reduce_t = cub::BlockReduce<unsigned long long, kBlock>;
-  __shared__ typename reduce_t::TempStorage temp;
+template <int Gs, typename graph_t, typename vertex_t>
+__global__ void __launch_bounds__(kBlock) bu_kernel(graph_t G, vertex_t* dist, vertex_t level, bu_items_t<graph_t> items,
+                                                    long long n, const unsigned long long* offsets, int grain,
+                                                    const uint32_t* front, uint32_t* next,
+                                                    unsigned long long* counters) {
   const vertex_t unvisited = std::numeric_limits<vertex_t>::max();
   unsigned long long awake = 0;
-  const vertex_t u = blockIdx.x * kBlock + threadIdx.x;
-  const int lane = threadIdx.x & 31;
-  bool big = false;
-  if (u < n && dist[u] == unvisited) {
-    const auto first = G.get_starting_edge(u), last = G.get_starting_edge(u + 1);
-    if (last - first > kWarpScan) {
-      big = true;
-    } else {
-      for (auto e = first; e < last; ++e) {
-        if (get_bit(front, G.get_destination_vertex(e))) {
-          dist[u] = level + 1;  // only u's thread writes u
-          awake++;
-          set_bit_atomic(next, u);
-          break;
-        }
+  gacge::lb::for_edges<Gs>(items, n, offsets, grain, [&](long long, vertex_t u, long long e) {
+    if (dist[u] != unvisited)  // found: GAP's break
+      return true;
+    if (get_bit(front, G.get_destination_vertex(e))) {
+      if (atomicCAS(dist + u, unvisited, level + 1) == unvisited) {
+        set_bit_atomic(next, u);
+        awake++;
       }
+      return true;
     }
-  }
-  // the warp scans its big vertices one by one, 32 neighbors at a time
-  unsigned big_lanes = __ballot_sync(0xffffffffu, big);
-  while (big_lanes) {
-    const int src_lane = __ffs(big_lanes) - 1;
-    big_lanes &= big_lanes - 1;
-    const vertex_t w = __shfl_sync(0xffffffffu, u, src_lane);
-    const auto first = G.get_starting_edge(w), last = G.get_starting_edge(w + 1);
-    for (auto e0 = first; e0 < last; e0 += 32) {
-      const auto e = e0 + lane;
-      const bool hit = e < last && get_bit(front, G.get_destination_vertex(e));
-      if (__ballot_sync(0xffffffffu, hit)) {
-        if (lane == src_lane) {
-          dist[w] = level + 1;
-          awake++;
-          set_bit_atomic(next, w);
-        }
-        break;
-      }
-    }
-  }
-  const unsigned long long sum = reduce_t(temp).Sum(awake);
-  if (threadIdx.x == 0 && sum)
-    atomicAdd(counters + 2, sum);
+    return false;
+  });
+  block_add(awake, counters + 2);
 }
 
 template <typename vertex_t>
@@ -282,8 +206,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   // switching state, allocated by init(), set by reset(), outside the timing
   bool gap_dobfs() const { return param.direction_optimized && rule_gap(); }
   vertex_t* queue[2] = {nullptr, nullptr};
-  vertex_t* heavy = nullptr;  // a top-down step's heavy vertices (gap::kHeavy)
-  int heavy_blocks = 0;
+  gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);
+  gacge::lb::offsets_t offsets;  // merge: a step's prefix sum of edges
   int cur = 0;
   unsigned long long queue_n = 0;
   uint32_t* front = nullptr;
@@ -297,10 +221,12 @@ struct problem_t : gunrock::problem_t<graph_t> {
 
   cudaStream_t stream() { return this->context->get_context(0)->stream(); }
   void read_counters() {
-    cudaMemcpyAsync(h_counters, d_counters, 4 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream());
+    cudaMemcpyAsync(h_counters, d_counters, 3 * sizeof(unsigned long long), cudaMemcpyDeviceToHost, stream());
     cudaStreamSynchronize(stream());
   }
-  void clear_counters() { cudaMemsetAsync(d_counters, 0, 4 * sizeof(unsigned long long), stream()); }
+  void clear_counters() {
+    cudaMemsetAsync(d_counters, 0, 3 * sizeof(unsigned long long), stream());
+  }
 
   void init() override {
     if (!gap_dobfs())
@@ -311,12 +237,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
       cudaMallocAsync(reinterpret_cast<void**>(&q), std::max<std::size_t>(n, 1) * sizeof(vertex_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&front), words * sizeof(uint32_t), stream());
     cudaMallocAsync(reinterpret_cast<void**>(&curr), words * sizeof(uint32_t), stream());
-    cudaMallocAsync(reinterpret_cast<void**>(&heavy), std::max<std::size_t>(n, 1) * sizeof(vertex_t), stream());
-    cudaMallocAsync(reinterpret_cast<void**>(&d_counters), 4 * sizeof(unsigned long long), stream());
-    cudaMallocHost(reinterpret_cast<void**>(&h_counters), 4 * sizeof(unsigned long long));
-    int sms = 0;
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
-    heavy_blocks = sms * 8;
+    if (lb == gacge::lb::mode_t::merge)
+      offsets.reserve(n);
+    cudaMallocAsync(reinterpret_cast<void**>(&d_counters), 3 * sizeof(unsigned long long), stream());
+    cudaMallocHost(reinterpret_cast<void**>(&h_counters), 3 * sizeof(unsigned long long));
   }
 
   void reset() override {
@@ -353,7 +277,6 @@ struct problem_t : gunrock::problem_t<graph_t> {
       return;
     for (auto q : queue)
       cudaFreeAsync(q, stream());
-    cudaFreeAsync(heavy, stream());
     cudaFreeAsync(front, stream());
     cudaFreeAsync(curr, stream());
     cudaFreeAsync(d_counters, stream());
@@ -408,8 +331,18 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       const long long old_awake = P->awake;
       cudaMemsetAsync(P->curr, 0, P->words * sizeof(uint32_t), stream);
       P->clear_counters();
-      gap::bu_kernel<<<blocks_n, gap::kBlock, 0, stream>>>(G, dist, P->level, P->front, P->curr, n,
-                                                          P->d_counters, gap::warp_scan());
+      {
+        gap::bu_items_t<decltype(G)> items{G, dist};
+        const long long nn = n;
+        gacge::lb::dispatch(P->lb, [&](auto tag) {
+          constexpr int Gs = decltype(tag)::value;
+          if constexpr (Gs == 0)
+            gacge::lb::prefix(items, nn, P->offsets.data, stream);
+          gap::bu_kernel<Gs><<<gacge::lb::grid<Gs>(nn), gap::kBlock, 0, stream>>>(
+              G, dist, P->level, items, nn, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain(), P->front, P->curr,
+              P->d_counters);
+        });
+      }
       P->read_counters();
       P->awake = (long long)P->h_counters[2];
       std::swap(P->front, P->curr);
@@ -429,11 +362,18 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     // edges_to_check -= scout_count; scout_count = TDStep(g, parent, queue)
     P->edges_to_check -= P->scout;
     P->clear_counters();
-    const unsigned int qb = (unsigned int)((P->queue_n + gap::kBlock - 1) / gap::kBlock);
-    gap::td_kernel<<<qb, gap::kBlock, 0, stream>>>(G, dist, P->level, P->queue[P->cur], P->queue_n,
-                                                  P->queue[P->cur ^ 1], P->d_counters, P->heavy, gap::heavy_deg());
-    gap::td_heavy_kernel<<<P->heavy_blocks, gap::kBlock, 0, stream>>>(G, dist, P->level, P->queue[P->cur ^ 1],
-                                                                     P->d_counters, P->heavy);
+    {
+      gacge::lb::frontier_tiles_t<decltype(G)> items{G, P->queue[P->cur]};
+      const long long nq = (long long)P->queue_n;
+      vertex_t* next = P->queue[P->cur ^ 1];
+      gacge::lb::dispatch(P->lb, [&](auto tag) {
+        constexpr int Gs = decltype(tag)::value;
+        if constexpr (Gs == 0)
+          gacge::lb::prefix(items, nq, P->offsets.data, stream);
+        gap::td_kernel<Gs><<<gacge::lb::grid<Gs>(nq), gap::kBlock, 0, stream>>>(
+            G, dist, P->level, items, nq, Gs == 0 ? P->offsets.data : nullptr, gacge::lb::grain(), next, P->d_counters);
+      });
+    }
     P->read_counters();
     P->cur ^= 1;
     P->queue_n = P->h_counters[0];
