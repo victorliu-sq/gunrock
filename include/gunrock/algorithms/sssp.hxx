@@ -71,11 +71,28 @@ inline bool sssp_fuse() {
   return v;
 }
 
+// GACGE_SSSP_FBUF: where a block keeps its bin-fusion queue and the vertices a
+// fusion round relaxes (GAP's thread-local current bin, up to 1000 vertices).
+// shared: in shared memory, about 8 KB a block, which held an SM to 6 blocks of
+// 128 threads (50% theoretical occupancy on the L4, 2026-10-17); global: in a
+// global buffer per resident block slot (an SM's slots are claimed and released
+// by bitmask), shared memory keeps only the counter. Same algorithm either way.
+inline bool sssp_fbuf_global() {
+  static const bool v = [] {
+    const char* e = std::getenv("GACGE_SSSP_FBUF");
+    return e == nullptr || std::string(e) != "shared";
+  }();
+  return v;
+}
+
 namespace delta {
 
 constexpr int kBlock = gacge::lb::kBlock;  // loops' launch box
 constexpr int kBinSizeThreshold = 1000;  // GAP's
 constexpr int kQueue = 1024;             // a block's current bin, >= the threshold
+constexpr int kSlots = 32;               // global fusion buffers per SM (> the 24 resident blocks of sm_89)
+constexpr int kMaxSm = 256;              // %smid bound for the global fusion buffers
+constexpr int kFuseBuf = kQueue + kBinSizeThreshold;  // a block's queue and fused vertices
 
 // The bins on the device: slots 0..R-1 hold bin b in slot b % R, slot R the
 // current bin's next frontier. desc = [buffer pointers | capacities | tails]
@@ -91,6 +108,8 @@ struct step_t {
   uint8_t* marked;
   unsigned long long* work;  // relaxed edges, GACGE_TRAVERSAL_STATS only
   bool fuse;
+  vertex_t* fbuf;     // global fusion buffers (kMaxSm x kSlots x kFuseBuf), GACGE_SSSP_FBUF=global
+  unsigned* fslots;   // per SM: the claimed slots of fbuf
   gacge::task::view_t task{};    // GACGE_TASK_STATS: per bin vertex
   gacge::task::view_t thread{};  // GACGE_TASK_STATS: per thread and step
 
@@ -134,26 +153,35 @@ __device__ bool relax(weight_t* dist, vertex_t v, weight_t nd) {
   return false;
 }
 
+// a block's bin-fusion state: its current-bin queue and the vertices a fusion
+// round relaxes, in shared memory (Global false) or a global buffer slot
+template <typename vertex_t, bool Global>
+struct fusion_storage_t {
+  vertex_t queue[kQueue];
+  vertex_t fused[kBinSizeThreshold];
+};
 template <typename vertex_t>
-struct fusion_shared_t {
-  vertex_t u[kBlock];
-  vertex_t queue[kQueue];             // the block's current-bin vertices
-  vertex_t fused[kBinSizeThreshold];  // the ones a fusion round relaxes
-  int queued;                         // may exceed kQueue: the rest went to slot R
+struct fusion_storage_t<vertex_t, true> {};
+
+template <typename vertex_t>
+struct fusion_t {
+  vertex_t* queue;  // the block's current-bin vertices
+  vertex_t* fused;  // the ones a fusion round relaxes
+  int* queued;      // in shared memory; may exceed kQueue: the rest went to slot R
 };
 
 // GAP's RelaxEdges for one edge: a new current-bin vertex goes to the
 // block's queue while fusing, any other to its bin
 template <typename graph_t, typename vertex_t, typename weight_t>
 __device__ __forceinline__ void relax_edge(const graph_t& G, const step_t<vertex_t, weight_t>& p,
-                                           fusion_shared_t<vertex_t>& sh, vertex_t u, long long e) {
+                                           const fusion_t<vertex_t>& sh, vertex_t u, long long e) {
   const vertex_t v = G.get_destination_vertex(e);
   const weight_t nd = p.dist[u] + G.get_edge_weight(e);
   if (relax(p.dist, v, nd)) {
     gacge::task::count(p.task, 0, 1);  // a successful relaxation
     const long long b = (long long)(nd / p.delta);
     if (b == p.bin && p.fuse) {
-      const int q = atomicAdd(&sh.queued, 1);
+      const int q = atomicAdd(sh.queued, 1);
       if (q < kQueue) {
         sh.queue[q] = v;
         return;
@@ -195,15 +223,42 @@ __device__ __forceinline__ void block_add(value_t x, unsigned long long* to) {
 // block (GAP's thread) relaxes its own current-bin vertices at once while
 // fewer than 1000, a round's vertices spread as the step's (thread-mapped: one
 // per thread; group-mapped: by its groups; merge-path: by the block).
-template <int Gs, typename graph_t, typename vertex_t, typename weight_t>
+template <int Gs, bool GlobalBuf, typename graph_t, typename vertex_t, typename weight_t>
 __global__ void __launch_bounds__(kBlock)
     step_kernel(graph_t G, step_t<vertex_t, weight_t> p, step_items_t<graph_t, weight_t> items, long long n,
                 gacge::lb::merge_args_t m) {
-  __shared__ fusion_shared_t<vertex_t> sh;
+  __shared__ fusion_storage_t<vertex_t, GlobalBuf> st;
+  __shared__ int queued;
+  __shared__ int fslot;  // global buffers: this block's slot, smid * kSlots + bit
   const int t = threadIdx.x;
-  if (t == 0)
-    sh.queued = 0;
+  if (t == 0) {
+    queued = 0;
+    if constexpr (GlobalBuf) {  // claim a free slot of this SM
+      unsigned smid;
+      asm volatile("mov.u32 %0, %%smid;" : "=r"(smid));
+      unsigned* mask = p.fslots + smid;
+      for (;;) {
+        const unsigned cur = *(volatile unsigned*)mask;
+        const int bit = __ffs(~cur) - 1;
+        if (bit < 0)
+          continue;
+        if (!(atomicOr(mask, 1u << bit) & (1u << bit))) {
+          fslot = (int)smid * kSlots + bit;
+          break;
+        }
+      }
+    }
+  }
   __syncthreads();
+  fusion_t<vertex_t> sh;
+  if constexpr (GlobalBuf) {
+    sh.queue = p.fbuf + (long long)fslot * kFuseBuf;
+    sh.fused = sh.queue + kQueue;
+  } else {
+    sh.queue = st.queue;
+    sh.fused = st.fused;
+  }
+  sh.queued = &queued;
   unsigned long long work = 0;
   auto f = [&](long long, vertex_t u, long long e) {
     if (p.task.cnt && e == (long long)G.get_starting_edge(u))  // task: a bin vertex, its edges
@@ -216,7 +271,7 @@ __global__ void __launch_bounds__(kBlock)
   __syncthreads();
   // GAP's bin fusion: while the local current bin is non-empty and below the threshold
   while (p.fuse) {
-    const int m = sh.queued;
+    const int m = queued;
     if (m == 0)
       break;
     if (m >= kBinSizeThreshold) {  // left to the next step, as GAP's shared frontier
@@ -228,7 +283,7 @@ __global__ void __launch_bounds__(kBlock)
       sh.fused[i] = sh.queue[i];
     __syncthreads();
     if (t == 0)
-      sh.queued = 0;
+      queued = 0;
     __syncthreads();
     for (int c = 0; c < m; c += kBlock) {
       const int kk = min(kBlock, m - c);
@@ -255,6 +310,11 @@ __global__ void __launch_bounds__(kBlock)
   gacge::task::record_warp(p.thread, work);
   if (p.work)
     block_add(work, p.work);
+  if constexpr (GlobalBuf) {  // release the slot
+    __syncthreads();
+    if (t == 0)
+      atomicAnd(p.fslots + fslot / kSlots, ~(1u << (fslot % kSlots)));
+  }
 }
 
 // after growing the overflowed slots: the marked vertices join the bin of their distance
@@ -319,6 +379,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long* h_desc = nullptr;  // pinned
   uint8_t* marked = nullptr;
   unsigned long long* d_work = nullptr;
+  vertex_t* fbuf = nullptr;    // GACGE_SSSP_FBUF=global: the blocks' fusion buffers
+  unsigned* fslots = nullptr;  // and their per-SM slot masks
   gacge::lb::mode_t lb = gacge::lb::mode(gacge::lb::mode_t::block);  // GAP's DeltaStep: many steps of small frontiers
   gacge::lb::merge_t merge;  // merge-path: the step's prefix sum of edges and its merge tiles
 
@@ -334,7 +396,8 @@ struct problem_t : gunrock::problem_t<graph_t> {
   }
 
   delta::step_t<vertex_t, weight_t> step() {
-    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), task.view(), thread.view()};
+    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), fbuf, fslots,
+            task.view(), thread.view()};
   }
 
   // the buffers' pointers and capacities to the descriptor, tails kept
@@ -388,6 +451,11 @@ struct problem_t : gunrock::problem_t<graph_t> {
     cudaMemsetAsync(marked, 0, n, stream());
     if (std::getenv("GACGE_TRAVERSAL_STATS"))
       cudaMallocAsync(&d_work, sizeof(unsigned long long), stream());
+    if (sssp_fbuf_global()) {
+      cudaMallocAsync(&fbuf, (std::size_t)delta::kMaxSm * delta::kSlots * delta::kFuseBuf * sizeof(vertex_t), stream());
+      cudaMallocAsync(&fslots, delta::kMaxSm * sizeof(unsigned), stream());
+      cudaMemsetAsync(fslots, 0, delta::kMaxSm * sizeof(unsigned), stream());
+    }
     if (lb == gacge::lb::mode_t::merge) {
       merge.reserve(cap);
       merge.reserve_work((long long)cap + g.get_number_of_edges());
@@ -439,6 +507,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
     cudaFreeAsync(marked, stream());
     if (d_work)
       cudaFreeAsync(d_work, stream());
+    if (fbuf)
+      cudaFreeAsync(fbuf, stream());
+    if (fslots)
+      cudaFreeAsync(fslots, stream());
     cudaStreamSynchronize(stream());
     cudaFreeHost(h_desc);
   }
@@ -546,12 +618,21 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           P->merge.reserve(n);
           P->merge.prefix(items, n, P->stream());
           const gacge::lb::merge_args_t m = P->merge.plan(P->merge.offsets, n, P->stream());
-          if (P->merge.tiles > 0)
-            delta::step_kernel<0><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(G, P->step(), items,
-                                                                                                 n, m);
+          if (P->merge.tiles > 0) {
+            if (sssp_fbuf_global())
+              delta::step_kernel<0, true><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(
+                  G, P->step(), items, n, m);
+            else
+              delta::step_kernel<0, false><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(
+                  G, P->step(), items, n, m);
+          }
         } else {
-          delta::step_kernel<Gs><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(G, P->step(), items, n,
-                                                                                        gacge::lb::merge_args_t{});
+          if (sssp_fbuf_global())
+            delta::step_kernel<Gs, true><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(
+                G, P->step(), items, n, gacge::lb::merge_args_t{});
+          else
+            delta::step_kernel<Gs, false><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(
+                G, P->step(), items, n, gacge::lb::merge_args_t{});
         }
       });
       P->download_tails();
