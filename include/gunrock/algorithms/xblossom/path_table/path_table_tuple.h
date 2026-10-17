@@ -1,5 +1,9 @@
 #ifndef PATH_TABLE_TUPLE_H
 #define PATH_TABLE_TUPLE_H
+
+#ifndef GACGE_TASK_STATS_BUILD
+#define GACGE_TASK_STATS_BUILD 0
+#endif
 // Vendored from X-Blossom (src/include/path_table/path_table_tuple.h) for the Gunrock X-Blossom app.
 // The tuple path table (XB_PATH_TABLE_TUPLE 1, flat nomat only): a node's
 // path to the root is not written out; every node keeps a fixed record of
@@ -262,11 +266,13 @@ namespace zblossom {
       // so over all lanes [0] is the warp-level executions of the loop body and
       // [1] the thread-level ones
       DEV_INLINE static void LaneTick(unsigned long long (&c)[2]) {
+#if GACGE_TASK_STATS_BUILD  // gacge_task_stats.hxx: compiled in only for the statistics build
         const unsigned m = __activemask();
         if ((threadIdx.x & 31) == __ffs(m) - 1) {
           c[0]++;
           c[1] += __popc(m);
         }
+#endif
       }
       bool lanes_ = false;
       mutable unsigned long long lane_walk_[2] = {0, 0}, lane_chain_[2] = {0, 0};

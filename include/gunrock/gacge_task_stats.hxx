@@ -11,6 +11,15 @@
 //   XBTask: prim=<p> kind=<k> tasks=<n> work=<sum> max=<m> sumsq=<s> extra=<a,b,c,d,e> buckets=<b:n:w;...>
 #pragma once
 
+// Compiled in only with -DGACGE_TASK_STATS_BUILD=1 (a separate build, e.g.
+// build-stats): the counting code, even never run, costs the timed kernels
+// registers and time (X-Blossom 20-25% slower on 2026-10-16). Without it every
+// record / count call is empty and enabled() is false, whatever the
+// environment says.
+#ifndef GACGE_TASK_STATS_BUILD
+#define GACGE_TASK_STATS_BUILD 0
+#endif
+
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
 #include <thrust/device_vector.h>
@@ -25,8 +34,10 @@ namespace task {
 constexpr int kBuckets = 320;
 constexpr int kExtra = 5;
 
+constexpr bool kBuilt = GACGE_TASK_STATS_BUILD != 0;
+
 inline bool enabled() {
-  static const bool on = std::getenv("GACGE_TASK_STATS") != nullptr;
+  static const bool on = kBuilt && std::getenv("GACGE_TASK_STATS") != nullptr;
   return on;
 }
 
@@ -59,6 +70,7 @@ inline unsigned long long bucket_low(int b) {
 }
 
 __device__ __forceinline__ void record(const view_t& s, unsigned long long len) {
+#if GACGE_TASK_STATS_BUILD
   if (s.cnt == nullptr)
     return;
   namespace cg = cooperative_groups;
@@ -76,10 +88,12 @@ __device__ __forceinline__ void record(const view_t& s, unsigned long long len) 
     atomicMax(s.tot + 2, mx);
     atomicAdd(s.sq, q);
   }
+#endif
 }
 
 // an extra counter k (0..kExtra-1), a warp's lanes adding up first
 __device__ __forceinline__ void count(const view_t& s, int k, unsigned long long v) {
+#if GACGE_TASK_STATS_BUILD
   if (s.cnt == nullptr)
     return;
   namespace cg = cooperative_groups;
@@ -87,6 +101,7 @@ __device__ __forceinline__ void count(const view_t& s, int k, unsigned long long
   const unsigned long long t = cg::reduce(g, v, cg::plus<unsigned long long>());
   if (g.thread_rank() == 0)
     atomicAdd(s.tot + 3 + k, t);
+#endif
 }
 
 // The warp-internal measure: called by all 32 lanes of every warp at one point
@@ -97,6 +112,7 @@ __device__ __forceinline__ void count(const view_t& s, int k, unsigned long long
 // no work adds nothing). extra[0] / extra[1] is the share of the lane slots its
 // work fills when every iteration costs the same.
 __device__ __forceinline__ void record_warp(const view_t& s, unsigned long long w) {
+#if GACGE_TASK_STATS_BUILD
   if (s.cnt == nullptr)
     return;
   __syncwarp(0xffffffffu);
@@ -108,6 +124,7 @@ __device__ __forceinline__ void record_warp(const view_t& s, unsigned long long 
     atomicAdd(s.tot + 4, 32ULL * mx);
     atomicAdd(s.tot + 5, 1ULL);
   }
+#endif
 }
 
 // record_warp's self-test: block 0, warp 0 all lanes 10 (100%); warp 1 31 lanes
