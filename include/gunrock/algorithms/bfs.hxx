@@ -125,6 +125,7 @@ __global__ void __launch_bounds__(kBlock) td_kernel(graph_t G, vertex_t* dist, v
   });
   if (mine)
     gacge::task::record(thr, mine);
+  gacge::task::record_warp(thr, mine);
   block_add(scout, counters + 1);
 }
 
@@ -223,6 +224,7 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
   }
   if (mine)
     gacge::task::record(thr, mine);
+  gacge::task::record_warp(thr, mine);
   block_add(awake, counters + 2);
 }
 

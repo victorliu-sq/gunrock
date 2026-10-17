@@ -399,6 +399,7 @@ __global__ void __launch_bounds__(kBlock)
   });
   if (mine)
     gacge::task::record(v, mine);
+  gacge::task::record_warp(v, mine);
 }
 
 template <typename graph_t, typename op_t>

@@ -89,6 +89,25 @@ __device__ __forceinline__ void count(const view_t& s, int k, unsigned long long
     atomicAdd(s.tot + 3 + k, t);
 }
 
+// The warp-internal measure: called by every lane of a warp at the end of its
+// work, w the lane's iterations (0 for a lane without work). The warp adds to
+// extra[0] the sum of its lanes' w, to extra[1] 32 x the largest w, to extra[2]
+// one: extra[0] / extra[1] is the share of the lane slots the warps' work
+// fills, the warp efficiency the work imbalance alone would leave.
+__device__ __forceinline__ void record_warp(const view_t& s, unsigned long long w) {
+  if (s.cnt == nullptr)
+    return;
+  namespace cg = cooperative_groups;
+  auto g = cg::coalesced_threads();
+  const unsigned long long sum = cg::reduce(g, w, cg::plus<unsigned long long>());
+  const unsigned long long mx = cg::reduce(g, w, cg::greater<unsigned long long>());
+  if (g.thread_rank() == 0 && mx > 0) {
+    atomicAdd(s.tot + 3, sum);
+    atomicAdd(s.tot + 4, 32ULL * mx);
+    atomicAdd(s.tot + 5, 1ULL);
+  }
+}
+
 // one task per listed vertex (all vertices without a list), its length the degree
 template <typename graph_t, typename vertex_t>
 __global__ void degree_tasks(graph_t G, const vertex_t* list, long long n, view_t s) {

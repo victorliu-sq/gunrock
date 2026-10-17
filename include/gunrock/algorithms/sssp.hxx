@@ -252,6 +252,7 @@ __global__ void __launch_bounds__(kBlock)
   }
   if (work)
     gacge::task::record(p.thread, work);  // this thread's edges in the step
+  gacge::task::record_warp(p.thread, work);
   if (p.work)
     block_add(work, p.work);
 }

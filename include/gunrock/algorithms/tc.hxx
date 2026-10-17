@@ -127,6 +127,7 @@ __global__ void tc_thread_stats_kernel(graph_t G, gacge::task::view_t v) {
   }
   if (mine)
     gacge::task::record(v, mine);
+  gacge::task::record_warp(v, mine);
 }
 
 // the edges (u, v), v < u, of u: N(u)'s entries below u
