@@ -202,10 +202,11 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
     big_lanes &= big_lanes - 1;
     const vertex_t w = __shfl_sync(0xffffffffu, u, src_lane);
     const auto first = G.get_starting_edge(w), last = G.get_starting_edge(w + 1);
-    unsigned long long checked = (unsigned long long)(last - first);
+    unsigned long long rounds = 0;  // this hub's rounds: each lane checks one neighbor a round
     for (auto e0 = first; e0 < last; e0 += 32) {
       const auto e = e0 + lane;
       mine++;  // a round: one check per lane
+      rounds++;
       const bool hit = e < last && get_bit(front, G.get_destination_vertex(e));
       const unsigned hits = __ballot_sync(0xffffffffu, hit);
       if (hits) {
@@ -214,12 +215,11 @@ __global__ void __launch_bounds__(kBlock) bu_twc_kernel(graph_t G, vertex_t* dis
           set_bit_atomic(next, w);
           awake++;
         }
-        checked = (unsigned long long)(e0 - first) + (unsigned long long)__ffs(hits);  // up to the first hit
         break;
       }
     }
-    if (lane == src_lane)
-      gacge::task::record(task, checked);
+    // task: a hub's scan split over the warp, 32 tasks of its rounds (one check per lane a round)
+    gacge::task::record(task, rounds);
   }
   if (mine)
     gacge::task::record(thr, mine);
@@ -445,6 +445,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       P->awake = (long long)P->h_counters[2];
       std::swap(P->front, P->curr);
       P->thread_bu.print("BFS", "thread-bottom-up", "level=" + std::to_string(P->level));
+      P->task_bu.print("BFS", "bottom-up-step", "level=" + std::to_string(P->level));
       P->level++;
       if (!(P->awake >= old_awake || P->awake > (long long)n / gap::kBeta)) {
         // BitmapToQueue(g, front, queue); scout_count = 1
@@ -695,7 +696,6 @@ float run(graph_t& G,
   enactor_type enactor(&problem, context, props);
   const float t = enactor.enact();
   problem.task_td.print("BFS", "top-down");
-  problem.task_bu.print("BFS", "bottom-up");
   return t;
 }
 
