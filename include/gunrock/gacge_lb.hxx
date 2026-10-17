@@ -238,7 +238,19 @@ using merge_setup_t = loops::schedule::setup<loops::schedule::algorithms_t::merg
 struct merge_args_t {
   const int* offsets = nullptr;
   meta_t* meta = nullptr;
+  int item_sync = 0;  // GACGE_LB_ITEM_SYNC: the warp reconverges after every item
 };
+
+// GACGE_LB_ITEM_SYNC=1 (experiment, off by default): merge_path's threads of a
+// warp synchronize (__syncwarp) at the end of each of their items, so a warp
+// that diverged inside an item's op runs the next item converged
+inline int item_sync_env() {
+  static const int on = [] {
+    const char* e = std::getenv("GACGE_LB_ITEM_SYNC");
+    return e ? std::atoi(e) : 0;
+  }();
+  return on;
+}
 
 struct no_done_t {
   __device__ void operator()() const {}
@@ -253,7 +265,9 @@ __device__ __forceinline__ void merge_path(const tiles_t& it, long long n, merge
   const std::size_t nnz = (std::size_t)m.offsets[n];
   merge_setup_t config(*m.meta, temporary_storage, const_cast<int*>(m.offsets), (std::size_t)n, nnz);
   auto map = config.init();
-  if (!config.is_valid_accessor(map))
+  const bool valid = config.is_valid_accessor(map);
+  const unsigned live = m.item_sync ? __ballot_sync(0xffffffffu, valid) : 0u;
+  if (!valid)
     return;
   long long cur = -1, row_begin = 0, start = 0;
   typename tiles_t::vertex_type u{};
@@ -275,6 +289,8 @@ __device__ __forceinline__ void merge_path(const tiles_t& it, long long n, merge
     } else {
       map.x++;
     }
+    if (m.item_sync)
+      __syncwarp(live);
   }
   done();
 }
@@ -355,7 +371,7 @@ struct merge_t {
     loops::schedule::merge_path::generate_search_coordinates<kBlock, kItems, layout_t, std::size_t, std::size_t>
         <<<(unsigned int)((tiles + 1 + kBlock - 1) / kBlock), kBlock, 0, stream>>>(
             layout_t(offs, (int)n, nnz), (std::size_t)n, (std::size_t)nnz, (std::size_t)tiles, coords);
-    return {offs, d_meta};
+    return {offs, d_meta, item_sync_env()};
   }
 };
 

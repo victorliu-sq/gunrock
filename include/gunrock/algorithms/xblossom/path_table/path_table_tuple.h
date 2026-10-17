@@ -224,6 +224,7 @@ namespace zblossom {
         Rec rv = Load(cur_v), rw = Load(cur_w);
         unsigned long long steps = 0;
         while (cur_v != cur_w) {
+          if (lanes_) LaneTick(lane_walk_);
           if (IsEmpty(rv)) { cur_v = w; } else { cur_v = Anchor(rv); }
           rv = Load(cur_v);
           if (IsEmpty(rw)) { cur_w = v; } else { cur_w = Anchor(rw); }
@@ -243,6 +244,7 @@ namespace zblossom {
         index_t cur = s;
         last_steps_ = 0;  // GACGE_TASK_STATS: the records this chain visits
         while (cur != base) {
+          if (lanes_) LaneTick(lane_chain_);
           const Rec r = Load(cur);
           last_steps_++;
           if (IsEmpty(r)) return; // the root without meeting the base: cannot happen in a static forest
@@ -253,6 +255,21 @@ namespace zblossom {
 
       // GACGE_TASK_STATS: the steps of the last base walk, chain scan or path flip of this view
       DEV_INLINE unsigned long long LastSteps() const { return last_steps_; }
+
+      // GACGE_TASK_STATS lane counts (lanes_ on): per loop iteration of the base
+      // walk and of the chain scans, the warp's lanes executing it together
+      // (__activemask); the lowest of them adds one execution and their number,
+      // so over all lanes [0] is the warp-level executions of the loop body and
+      // [1] the thread-level ones
+      DEV_INLINE static void LaneTick(unsigned long long (&c)[2]) {
+        const unsigned m = __activemask();
+        if ((threadIdx.x & 31) == __ffs(m) - 1) {
+          c[0]++;
+          c[1] += __popc(m);
+        }
+      }
+      bool lanes_ = false;
+      mutable unsigned long long lane_walk_[2] = {0, 0}, lane_chain_[2] = {0, 0};
 
       // Flip the matching along the augmenting path v ~> root_v, (v, w), w ~> root_w
       DEV_INLINE void AddAugmentingPath(index_t v, index_t w, DArrayView<index_t> matching) {

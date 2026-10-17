@@ -319,6 +319,10 @@ class engine_t {
   thrust::device_vector<edge_t> segments_;
 
   gacge::task::stats_t task_all_, task_walk_, task_flip_, task_step_, task_thr_;  // GACGE_TASK_STATS
+  // GACGE_TASK_STATS, per blossom step: warp-level executions and thread-level ones
+  // (lanes executing together) of the op's entry and its closing branch (lane_op_:
+  // extra 0..3), of the base walk's and the chain scans' loop bodies (lane_loop_)
+  gacge::task::stats_t lane_op_, lane_loop_;
   size_t blossom_step_{0};                                             // the blossom steps printed
   unsigned long long task_fe_{0};                          // the frontier edges of the run's advances
 
@@ -673,6 +677,7 @@ class engine_t {
     const index_t nnodes = nnodes_;
     auto matching_v = dev_matching_.DeviceView();
     auto path_table_v = path_table_.DeviceView();
+    if constexpr (kTuple) path_table_v.lanes_ = gacge::task::enabled();  // the walks' lane counts
     auto is_even_v = is_even_.DeviceView();
     auto tree_roots_v = tree_roots_.DeviceView();
     auto queue_v = enode_queue_.DeviceView();
@@ -694,10 +699,13 @@ class engine_t {
       if (count) dev_blossoms_.SetH2D(0);
       auto blossoms_v = dev_blossoms_.DeviceView();
       const gacge::task::view_t task_all = task_all_.view(), task_walk = task_walk_.view(),
-                                task_step = task_step_.view();
+                                task_step = task_step_.view(), lane_op = lane_op_.view(), lane_loop = lane_loop_.view();
       const unsigned long long fe_before = task_fe_;
       auto blossom_op = [=] __device__(vertex_t const& v, vertex_t const& w, edge_t const&, weight_t const&) -> unsigned long long {
-        const gacge::task::view_t t_all = task_all, t_walk = task_walk, t_step = task_step;
+        const gacge::task::view_t t_all = task_all, t_walk = task_walk, t_step = task_step, l_op = lane_op,
+                                  l_loop = lane_loop;
+        unsigned long long lane_entry[2] = {0, 0}, lane_close[2] = {0, 0};
+        if (l_op.cnt) zblossom::dev::TuplePathTableView::LaneTick(lane_entry);
         auto matching = matching_v;
         auto path_table = path_table_v;
         auto is_even = is_even_v;
@@ -711,6 +719,7 @@ class engine_t {
         index_t root_v = tree_roots[v];
         index_t root_w = tree_roots[w];
         if (is_even[w] && root_v == root_w && matching[v] != w && root_w != nnodes) {
+          if (l_op.cnt) zblossom::dev::TuplePathTableView::LaneTick(lane_close);
           index_t base;
           path_table.FindBlossomBaseByAnchorNode(v, w, base);
           unsigned long long len = 1;  // task: a closing edge, its check, base walk and two chain scans
@@ -727,6 +736,18 @@ class engine_t {
             gacge::task::record(t_step, len - 1);  // this step's walk: base walk + the two chain scans
           }
         }
+        if constexpr (kTuple) {
+          if (l_op.cnt) {
+            gacge::task::count(l_op, 0, lane_entry[0]);
+            gacge::task::count(l_op, 1, lane_entry[1]);
+            gacge::task::count(l_op, 2, lane_close[0]);
+            gacge::task::count(l_op, 3, lane_close[1]);
+            gacge::task::count(l_loop, 0, path_table.lane_walk_[0]);
+            gacge::task::count(l_loop, 1, path_table.lane_walk_[1]);
+            gacge::task::count(l_loop, 2, path_table.lane_chain_[0]);
+            gacge::task::count(l_loop, 3, path_table.lane_chain_[1]);
+          }
+        }
         return work;
       };
       if (gacge::task::enabled())
@@ -741,6 +762,8 @@ class engine_t {
                          "step=" + std::to_string(blossom_step_) + " frontier_e=" + std::to_string(fe) +
                              " closing=" + std::to_string(closing));
         task_thr_.print("X-Blossom", "thread-blossom-step", "step=" + std::to_string(blossom_step_));
+        lane_op_.print("X-Blossom", "lanes-op", "step=" + std::to_string(blossom_step_));
+        lane_loop_.print("X-Blossom", "lanes-loop", "step=" + std::to_string(blossom_step_));
         blossom_step_++;
       }
       const size_t num_tasks = blossom_offset_list_.size();
