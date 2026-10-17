@@ -74,6 +74,31 @@ inline int tc_heavy() {
   return v;
 }
 
+// GACGE_TC_ITEM (experiment; 0, the default: thrust::for_each): 1 the per-edge
+// count by tc_item_kernel, which spreads the edges as CUB's for_each does (256
+// threads a block, 2 edges a thread, block-striped); 2 the same with the warp
+// reconverging (__syncwarp) after each of a thread's two edges
+inline int tc_item() {
+  static const int v = [] {
+    const char* e = std::getenv("GACGE_TC_ITEM");
+    return e ? std::atoi(e) : 0;
+  }();
+  return v;
+}
+
+template <typename graph_t, typename op_t>
+__global__ void __launch_bounds__(256) tc_item_kernel(graph_t G, op_t op, int item_sync) {
+  using edge_t = typename graph_t::edge_type;
+  const long long m = G.get_number_of_edges();
+  for (int j = 0; j < 2; ++j) {
+    const long long e = (long long)blockIdx.x * 512 + threadIdx.x + j * 256;
+    if (e < m)
+      op((edge_t)e);
+    if (item_sync)
+      __syncwarp();
+  }
+}
+
 // |N(s) and N(d) below d| by a merge (Ligra's countCommon)
 template <typename graph_t, typename vertex_t>
 __device__ __forceinline__ vertex_t tc_merge(const graph_t& G, vertex_t s, vertex_t d) {
@@ -385,8 +410,15 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           oriented(G.get_source_vertex(e), G.get_destination_vertex(e), e,
                    weight_t(0));
         };
-        operators::parallel_for::execute<operators::parallel_for_each_t::edge>(
-            G, per_edge, context);
+        if (tc_item()) {
+          const long long m = G.get_number_of_edges();
+          tc_item_kernel<<<(unsigned int)((m + 511) / 512), 256, 0, this->context->get_context(0)->stream()>>>(
+              G, per_edge, tc_item() == 2);
+          error::throw_if_exception(cudaGetLastError(), "tc item kernel");
+        } else {
+          operators::parallel_for::execute<operators::parallel_for_each_t::edge>(
+              G, per_edge, context);
+        }
         if (gacge::task::enabled()) {
           const long long m = G.get_number_of_edges();
           tc_thread_stats_kernel<<<(unsigned int)((m + 511) / 512), 256>>>(G, P->thread.view());
