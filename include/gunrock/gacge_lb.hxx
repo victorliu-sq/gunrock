@@ -238,18 +238,21 @@ using merge_setup_t = loops::schedule::setup<loops::schedule::algorithms_t::merg
 struct merge_args_t {
   const int* offsets = nullptr;
   meta_t* meta = nullptr;
-  int item_sync = 0;  // GACGE_LB_ITEM_SYNC: the warp reconverges after every item
+  int item_sync = 0;  // the warp reconverges after every item (merge_t::item_sync)
 };
 
-// GACGE_LB_ITEM_SYNC=1 (experiment, off by default): merge_path's threads of a
-// warp synchronize (__syncwarp) at the end of each of their items, so a warp
-// that diverged inside an item's op runs the next item converged
-inline int item_sync_env() {
-  static const int on = [] {
+// merge_path's per-item warp sync: the threads of a warp synchronize
+// (__syncwarp) at the end of each of their items, so a warp that diverged
+// inside an item's op runs the next item converged. On for X-Blossom (since
+// 2026-10-16: without it a warp split by one lane's blossom walk never
+// reconverged, ~3 lanes running together), off for BFS (no effect there);
+// GACGE_LB_ITEM_SYNC=0/1 overrides either
+inline int item_sync_env(int dflt) {
+  static const int env = [] {
     const char* e = std::getenv("GACGE_LB_ITEM_SYNC");
-    return e ? std::atoi(e) : 0;
+    return e ? std::atoi(e) : -1;
   }();
-  return on;
+  return env >= 0 ? env : dflt;
 }
 
 struct no_done_t {
@@ -316,6 +319,7 @@ struct merge_t {
   long long coords_cap = 0;  // merge tiles + 1
   meta_t* d_meta = nullptr;
   long long tiles = 0;  // the last plan's merge tiles: the grid
+  int item_sync = 0;    // the per-item warp sync's default for this primitive (item_sync_env)
   merge_t() = default;
   merge_t(const merge_t&) = delete;
   merge_t& operator=(const merge_t&) = delete;
@@ -371,7 +375,7 @@ struct merge_t {
     loops::schedule::merge_path::generate_search_coordinates<kBlock, kItems, layout_t, std::size_t, std::size_t>
         <<<(unsigned int)((tiles + 1 + kBlock - 1) / kBlock), kBlock, 0, stream>>>(
             layout_t(offs, (int)n, nnz), (std::size_t)n, (std::size_t)nnz, (std::size_t)tiles, coords);
-    return {offs, d_meta, item_sync_env()};
+    return {offs, d_meta, item_sync_env(item_sync)};
   }
 };
 

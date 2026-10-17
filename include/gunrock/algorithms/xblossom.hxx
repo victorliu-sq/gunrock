@@ -136,6 +136,7 @@ class engine_t {
     scan_temp_.resize(bytes);
     scan_temp_bytes_ = bytes;
     if (gacge::lb::enabled()) {
+      lb_merge_.item_sync = 1;  // merge_path's per-item warp sync (gacge_lb.hxx item_sync_env)
       lb_merge_.reserve(nnodes_);
       lb_merge_.reserve_work((long long)nnodes_ + G.get_number_of_edges());
     }
