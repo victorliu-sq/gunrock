@@ -550,8 +550,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
             delta::step_kernel<0><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(G, P->step(), items,
                                                                                                  n, m);
         } else {
-          delta::step_kernel<Gs><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(
-              G, P->step(), items, n, gacge::lb::merge_args_t{nullptr, nullptr, gacge::lb::item_sync_env()});
+          delta::step_kernel<Gs><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(G, P->step(), items, n,
+                                                                                        gacge::lb::merge_args_t{});
         }
       });
       P->download_tails();

@@ -141,10 +141,9 @@ __device__ __forceinline__ void thread_mapped(const tiles_t& it, long long n, fu
   }
 }
 
-// group-mapped (groups of G, a block of kBlock): loops' setup<group_mapped>;
-// item_sync (GACGE_LB_ITEM_SYNC): the warp reconverges after every atom round
+// group-mapped (groups of G, a block of kBlock): loops' setup<group_mapped>
 template <int G, typename tiles_t, typename func_t>
-__device__ __forceinline__ void group_mapped(const tiles_t& it, long long n, func_t f, int item_sync = 0) {
+__device__ __forceinline__ void group_mapped(const tiles_t& it, long long n, func_t f) {
   using layout_t = edge_layout_t<tiles_t>;
   using setup_t =
       loops::schedule::setup<loops::schedule::algorithms_t::group_mapped, kBlock, G, int, int, int, int, layout_t>;
@@ -161,35 +160,17 @@ __device__ __forceinline__ void group_mapped(const tiles_t& it, long long n, fun
   __syncthreads();
   setup_t config(temporary_storage, layout_t{it, (int)n});
   auto p = config.partition();
-  auto range = config.atom_accessor(p);
-  auto body = [&](auto virtual_atom) {
+  for (auto virtual_atom : config.atom_accessor(p)) {
     auto virtual_tile = config.tile_accessor(virtual_atom, p);
     if (!config.is_valid_accessor(virtual_tile, p))
-      return;
+      continue;
     const int slot = (int)virtual_tile + (int)(p.meta_group_rank() * p.size());
     if (s_stop[slot])
-      return;
+      continue;
     auto tile = config.tile_id(virtual_tile, p);
     auto e = config.atom_id(virtual_atom, tile, virtual_tile, p);
     if (f((long long)tile, s_u[slot], (long long)e))
       s_stop[slot] = 1;
-  };
-  if (!item_sync) {
-    for (auto virtual_atom : range)
-      body(virtual_atom);
-  } else {  // every lane of the warp runs the same rounds, idle once its atoms are done
-    auto a = range.begin();
-    const auto a_end = range.end();
-    while (true) {
-      const bool act = a != a_end;
-      if (!__ballot_sync(0xffffffffu, act))
-        break;
-      if (act) {
-        body(*a);
-        ++a;
-      }
-      __syncwarp();
-    }
   }
   __syncthreads();
 }
@@ -322,7 +303,7 @@ __device__ __forceinline__ void for_edges(const tiles_t& it, long long n, merge_
   else if constexpr (G == 0)
     merge_path(it, n, m, f);
   else
-    group_mapped<G>(it, n, f, m.item_sync);
+    group_mapped<G>(it, n, f);
 }
 
 // the merge-path side of a primitive: the tiles' prefix sum, the merge tiles'
