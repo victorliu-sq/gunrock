@@ -1,6 +1,7 @@
 #include <gunrock/algorithms/pr.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gacge_bin.hxx>  // GACGE
 
 using namespace gunrock;
 using namespace memory;
@@ -22,15 +23,20 @@ void test_pr(int num_arguments, char** argument_array) {
   gunrock::io::cli::parameters_t params(num_arguments, argument_array,
                                         "Page Rank");
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(params.filename);
-
+  // GACGE: <name>.bin, the GACGE binary CSR the other frameworks read (gacge_bin.hxx)
   csr_t csr;
-
-  if (params.binary) {
-    csr.read_binary(params.filename);
+  graph::graph_properties_t properties;
+  if (params.gacge_binary) {
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::ones);
   } else {
-    csr.from_coo(coo);
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(params.filename);
+    properties = props;
+    if (params.binary) {
+      csr.read_binary(params.filename);
+    } else {
+      csr.from_coo(coo);
+    }
   }
 
   // --
@@ -87,8 +93,8 @@ void test_pr(int num_arguments, char** argument_array) {
 
   print::head(p, 40, "GPU rank");
 
-  std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]
-            << " (ms)" << std::endl;
+  for (auto t : run_times)  // GACGE: every run's time
+    std::cout << "GPU Elapsed Time : " << t << " (ms)" << std::endl;
 }
 
 int main(int argc, char** argv) {

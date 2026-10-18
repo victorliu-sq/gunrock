@@ -3,6 +3,7 @@
 #include "sssp_cpu.hxx"  // Reference implementation
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gacge_bin.hxx>  // GACGE
 
 using namespace gunrock;
 using namespace memory;
@@ -17,8 +18,11 @@ void test_sssp(int num_arguments, char** argument_array) {
 
   using csr_t =
       format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
+  // GACGE: GACGE_STOCK_ALGO=gunrock runs the original 'Single Source Shortest Path'
+  // (advance, block_mapped), anything else the example's default, DAWN
+  const char* gacge_algo = std::getenv("GACGE_STOCK_ALGO");
   std::string DEFAULT_SSSP_ALGORITHMS =
-      "DAWN";  // Using 'Single Source Shortest Path' here will call the
+      (gacge_algo && std::string(gacge_algo) == "gunrock") ? "Single Source Shortest Path" : "DAWN";  // Using 'Single Source Shortest Path' here will call the
                // original SSSP
   // --
   // IO
@@ -26,15 +30,20 @@ void test_sssp(int num_arguments, char** argument_array) {
   gunrock::io::cli::parameters_t params(num_arguments, argument_array,
                                         DEFAULT_SSSP_ALGORITHMS);
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(params.filename);
-
+  // GACGE: <name>.bin, the GACGE binary CSR the other frameworks read (gacge_bin.hxx)
   csr_t csr;
-
-  if (params.binary) {
-    csr.read_binary(params.filename);
+  graph::graph_properties_t properties;
+  if (params.gacge_binary) {
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::weights);
   } else {
-    csr.from_coo(coo);
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(params.filename);
+    properties = props;
+    if (params.binary) {
+      csr.read_binary(params.filename);
+    } else {
+      csr.from_coo(coo);
+    }
   }
 
   // --
@@ -115,8 +124,8 @@ void test_sssp(int num_arguments, char** argument_array) {
   // Log
 
   print::head(distances, 40, "GPU distances");
-  std::cout << "GPU Elapsed Time : " << run_times[params.num_runs - 1]
-            << " (ms)" << std::endl;
+  for (auto t : run_times)  // GACGE: every run's time
+    std::cout << "GPU Elapsed Time : " << t << " (ms)" << std::endl;
 
   // --
   // CPU Run

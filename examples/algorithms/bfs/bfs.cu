@@ -2,6 +2,7 @@
 #include <gunrock/algorithms/dawn.hxx>
 #include <gunrock/util/performance.hxx>
 #include <gunrock/io/parameters.hxx>
+#include <gunrock/io/gacge_bin.hxx>  // GACGE
 #include <gunrock/framework/benchmark.hxx>
 
 #include "bfs_cpu.hxx"  // Reference implementation
@@ -20,23 +21,31 @@ void test_bfs(int num_arguments, char** argument_array) {
   using csr_t =
       format::csr_t<memory_space_t::device, vertex_t, edge_t, weight_t>;
 
+  // GACGE: GACGE_STOCK_ALGO=gunrock runs the original 'Breadth First Search'
+  // (advance, block_mapped), anything else the example's default, DAWN
+  const char* gacge_algo = std::getenv("GACGE_STOCK_ALGO");
   std::string DEFAULT_BFS_ALGORITHMS =
-      "DAWN";  // Using 'Breadth First Search' here will call the original BFS
+      (gacge_algo && std::string(gacge_algo) == "gunrock") ? "Breadth First Search" : "DAWN";  // Using 'Breadth First Search' here will call the original BFS
   // --
   // IO
 
   gunrock::io::cli::parameters_t params(num_arguments, argument_array,
                                         DEFAULT_BFS_ALGORITHMS);
 
-  io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
-  auto [properties, coo] = mm.load(params.filename);
-
+  // GACGE: <name>.bin, the GACGE binary CSR the other frameworks read (gacge_bin.hxx)
   csr_t csr;
-
-  if (params.binary) {
-    csr.read_binary(params.filename);
+  graph::graph_properties_t properties;
+  if (params.gacge_binary) {
+    gacge_bin::load_device_csr(params.filename, csr, gacge_bin::values_t::ones);
   } else {
-    csr.from_coo(coo);
+    io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
+    auto [props, coo] = mm.load(params.filename);
+    properties = props;
+    if (params.binary) {
+      csr.read_binary(params.filename);
+    } else {
+      csr.from_coo(coo);
+    }
   }
 
   // --
@@ -101,8 +110,8 @@ void test_bfs(int num_arguments, char** argument_array) {
   // Print info for last run
   std::cout << "Source : " << source_vect.back() << "\n";
   print::head(distances, 40, "GPU distances");
-  std::cout << "GPU Elapsed Time : " << run_times[n_runs - 1] << " (ms)"
-            << std::endl;
+  for (auto t : run_times)  // GACGE: every run's time
+    std::cout << "GPU Elapsed Time : " << t << " (ms)" << std::endl;
 
   // --
   // CPU Run

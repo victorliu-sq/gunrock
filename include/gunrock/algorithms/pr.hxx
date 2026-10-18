@@ -8,6 +8,7 @@
  *
  */
 #pragma once
+#include <cstdlib>  // GACGE: getenv
 
 #include <gunrock/algorithms/algorithms.hxx>
 #include <thrust/iterator/counting_iterator.h>
@@ -170,6 +171,12 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
   virtual bool is_converged(gcuda::multi_context_t& context) {
     if (this->iteration == 0)
       return false;
+
+    // GACGE: GACGE_PR_ITERS=k stops after exactly k iterations instead of the
+    // tolerance test (the GACGE PageRank's fixed 20); the iteration is unchanged
+    static const int gacge_iters = std::getenv("GACGE_PR_ITERS") ? std::atoi(std::getenv("GACGE_PR_ITERS")) : 0;
+    if (gacge_iters > 0)
+      return this->iteration >= gacge_iters;
 
     auto P = this->get_problem();
     auto G = P->get_graph();

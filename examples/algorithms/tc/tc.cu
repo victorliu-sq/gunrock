@@ -1,6 +1,7 @@
 #include <vector>
 
 #include <gunrock/algorithms/tc.hxx>
+#include <gunrock/io/gacge_bin.hxx>  // GACGE
 #include "tc_cpu.hxx"
 
 #include <cxxopts.hpp>
@@ -64,7 +65,10 @@ void test_tc(int num_arguments, char** argument_array) {
   gunrock::graph::graph_properties_t properties =
       gunrock::graph::graph_properties_t();
 
-  if (util::is_market(params.filename)) {
+  const std::string& fn = params.filename;  // GACGE: <name>.bin, the GACGE binary CSR (gacge_bin.hxx)
+  if (fn.size() > 4 && fn.substr(fn.size() - 4) == ".bin") {
+    gacge_bin::load_device_csr(fn, csr, gacge_bin::values_t::ones);
+  } else if (util::is_market(params.filename)) {
     io::matrix_market_t<vertex_t, edge_t, weight_t> mm;
     auto [properties, coo] = mm.load(params.filename);
     if (!properties.symmetric) {
