@@ -319,6 +319,7 @@ struct merge_t {
   long long coords_cap = 0;  // merge tiles + 1
   meta_t* d_meta = nullptr;
   long long tiles = 0;  // the last plan's merge tiles: the grid
+  long long last_nnz = 0;  // the last plan's units (edges)
   int item_sync = 0;    // the per-item warp sync's default for this primitive (item_sync_env)
   merge_t() = default;
   merge_t(const merge_t&) = delete;
@@ -370,6 +371,7 @@ struct merge_t {
     cudaMemcpyAsync(&nnz, offs + n, sizeof(int), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
     tiles = (n + nnz + kMergeTile - 1) / kMergeTile;
+    last_nnz = nnz;
     reserve_work(n + nnz);
     using layout_t = loops::layout::csr<int, int>;
     loops::schedule::merge_path::generate_search_coordinates<kBlock, kItems, layout_t, std::size_t, std::size_t>

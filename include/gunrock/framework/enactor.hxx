@@ -261,6 +261,8 @@ struct enactor_t {
    * XBTraversal's work_e for GACGE_TRAVERSAL_STATS; negative: not counted.
    */
   virtual long long traversal_work_e() { return -1; }
+  // GACGE_STEP_TIMES: what the last loop() did (kind, frontier, launch), for its XBStepTime line
+  virtual std::string step_info() { return ""; }
 
   /**
    * @brief Swap the inactive and active frontier buffers such that the inactive
@@ -296,8 +298,22 @@ struct enactor_t {
     std::size_t t_steps = 0, t_v = 0, t_e = 0, t_max_e = 0, t_small = 0, t_imb_n = 0;
     double t_imb = 0;  // sum over steps of max degree / mean degree of the frontier
     auto timer = single_context->timer();
+    // GACGE_STEP_TIMES: an event on the context's stream after every loop(): each
+    // step's time on the GPU's timeline (its kernels and the host's gaps before the
+    // next launch), one XBStepTime line per step after the run
+    const bool step_times = std::getenv("GACGE_STEP_TIMES") != nullptr;
+    std::vector<cudaEvent_t> step_ev;
+    std::vector<std::string> step_lab;
+    auto record = [&]() {
+      cudaEvent_t e;
+      cudaEventCreate(&e);
+      cudaEventRecord(e, single_context->stream());
+      step_ev.push_back(e);
+    };
     gacge::profile::Begin();  // GACGE_PROFILE_TRIAL (gacge_profile.hxx)
     timer.begin();
+    if (step_times)
+      record();
     while (!is_converged(*context)) {
       if (stats) {
         std::size_t fv = 0, fe = 0, md = 0;
@@ -312,10 +328,24 @@ struct enactor_t {
       }
       loop(*context);
       ++iteration;
+      if (step_times) {
+        record();
+        step_lab.push_back(step_info());
+      }
     }
     finalize(*context);
     auto runtime = timer.end();
     gacge::profile::End();
+    if (step_times) {
+      cudaStreamSynchronize(single_context->stream());
+      for (std::size_t i = 1; i < step_ev.size(); i++) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, step_ev[i - 1], step_ev[i]);
+        std::printf("XBStepTime: run=%d step=%zu %s ms=%.4f\n", enact_index, i - 1, step_lab[i - 1].c_str(), ms);
+      }
+      for (cudaEvent_t e : step_ev)
+        cudaEventDestroy(e);
+    }
     if (stats) {
       const long long work_e = traversal_work_e();
       const std::string work = work_e >= 0 ? " work_e=" + std::to_string(work_e) : "";

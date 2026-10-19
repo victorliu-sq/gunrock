@@ -375,6 +375,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long front_n = 0;
   long long bin = 0;
   bool done = false;
+  long long last_bin = 0, last_n = 0, last_e = 0, last_blocks = 0;  // GACGE_STEP_TIMES
   unsigned long long* d_desc = nullptr;
   unsigned long long* h_desc = nullptr;  // pinned
   uint8_t* marked = nullptr;
@@ -559,6 +560,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       f->push_back(P->param.single_source);
   }
 
+  std::string step_info() override {
+    auto P = this->get_problem();
+    char b[160];
+    std::snprintf(b, sizeof(b), "kind=bin bin=%lld n=%lld e=%lld blocks=%lld", P->last_bin, P->last_n, P->last_e,
+                  P->last_blocks);
+    return b;
+  }
+
   bool is_converged(gcuda::multi_context_t& context) override {
     if (sssp_delta())
       return this->get_problem()->done;
@@ -610,6 +619,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     if (sssp_delta()) {
       const int R = P->R;
       const long long n = (long long)P->front_n;
+      P->last_bin = P->bin;
+      P->last_n = n;
+      P->last_e = 0;
+      P->last_blocks = 0;
       delta::step_items_t<decltype(G), weight_t> items{G, P->front.first, P->result.distances,
                                                        P->delta_w * (weight_t)P->bin};
       gacge::lb::dispatch(P->lb, [&](auto tag) {
@@ -618,6 +631,8 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           P->merge.reserve(n);
           P->merge.prefix(items, n, P->stream());
           const gacge::lb::merge_args_t m = P->merge.plan(P->merge.offsets, n, P->stream());
+          P->last_e = P->merge.last_nnz;
+          P->last_blocks = P->merge.tiles;
           if (P->merge.tiles > 0) {
             if (sssp_fbuf_global())
               delta::step_kernel<0, true><<<(unsigned int)P->merge.tiles, delta::kBlock, 0, P->stream()>>>(
@@ -627,6 +642,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
                   G, P->step(), items, n, m);
           }
         } else {
+          P->last_blocks = gacge::lb::grid(n);
           if (sssp_fbuf_global())
             delta::step_kernel<Gs, true><<<gacge::lb::grid(n), delta::kBlock, 0, P->stream()>>>(
                 G, P->step(), items, n, gacge::lb::merge_args_t{});

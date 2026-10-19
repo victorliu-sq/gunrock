@@ -315,6 +315,10 @@ struct problem_t : gunrock::problem_t<graph_t> {
   unsigned long long* h_counters = nullptr;  // pinned
   long long edges_to_check = 0, scout = 0, awake = 0;
   bool pulling = false;
+  // GACGE_STEP_TIMES: the last step's kind, frontier vertices and edges, launched blocks
+  const char* last_kind = "";
+  long long last_n = 0, last_e = 0, last_blocks = 0;
+  int last_conv = 0;  // 1: a queue-to-bitmap conversion in the step, 2: bitmap-to-queue
   vertex_t level = 0;
 
   cudaStream_t stream() { return this->context->get_context(0)->stream(); }
@@ -404,6 +408,14 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       f->push_back(P->param.single_source);
   }
 
+  std::string step_info() override {
+    auto P = this->get_problem();
+    char b[160];
+    std::snprintf(b, sizeof(b), "kind=%s n=%lld e=%lld blocks=%lld conv=%d", P->last_kind, P->last_n, P->last_e,
+                  P->last_blocks, P->last_conv);
+    return b;
+  }
+
   bool is_converged(gcuda::multi_context_t& context) override {
     auto P = this->get_problem();
     if (P->gap_dobfs())
@@ -419,7 +431,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto stream = P->stream();
     const vertex_t n = G.get_number_of_vertices();
     const unsigned int blocks_n = (unsigned int)(((long long)n + gap::kBlock - 1) / gap::kBlock);
+    P->last_conv = 0;
     if (!P->pulling && P->scout > P->edges_to_check / gap::alpha()) {
+      P->last_conv = 1;
       // QueueToBitmap(queue, front); awake_count = queue.size()
       const unsigned int qb = (unsigned int)((P->queue_n + gap::kBlock - 1) / gap::kBlock);
       gap::queue_to_bitmap_kernel<<<qb, gap::kBlock, 0, stream>>>(P->queue[P->cur], P->queue_n, P->front);
@@ -429,6 +443,10 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     if (P->pulling) {
       // awake_count = BUStep(g, parent, front, curr); front.swap(curr)
       const long long old_awake = P->awake;
+      P->last_kind = "bu";
+      P->last_n = old_awake;
+      P->last_e = (long long)G.get_number_of_edges();
+      P->last_blocks = gacge::lb::grid(n);
       cudaMemsetAsync(P->curr, 0, P->words * sizeof(uint32_t), stream);
       P->clear_counters();
       {
@@ -447,6 +465,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
             m = P->merge.plan(P->merge.offsets, nn, stream);
             g = (unsigned int)std::max<long long>(1, P->merge.tiles);
           }
+          P->last_blocks = g;
           gap::bu_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(
               G, dist, P->level, items, nn, m, P->front, P->curr,
               P->d_counters);
@@ -459,6 +478,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       P->task_bu.print("BFS", "bottom-up-step", "level=" + std::to_string(P->level));
       P->level++;
       if (!(P->awake >= old_awake || P->awake > (long long)n / gap::beta())) {
+        P->last_conv = 2;
         // BitmapToQueue(g, front, queue); scout_count = 1
         P->clear_counters();
         gap::bitmap_to_queue_kernel<<<blocks_n, gap::kBlock, 0, stream>>>(P->front, n, P->queue[P->cur],
@@ -472,6 +492,9 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     }
     // edges_to_check -= scout_count; scout_count = TDStep(g, parent, queue)
     P->edges_to_check -= P->scout;
+    P->last_kind = "td";
+    P->last_n = (long long)P->queue_n;
+    P->last_e = P->scout;
     P->clear_counters();
     {
       gacge::lb::frontier_tiles_t<decltype(G)> items{G, P->queue[P->cur]};
@@ -489,6 +512,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
           m = P->merge.plan(P->merge.offsets, nq, stream);
           g = (unsigned int)std::max<long long>(1, P->merge.tiles);
         }
+        P->last_blocks = g;
         gap::td_kernel<Gs><<<g, gap::kBlock, 0, stream>>>(G, dist, P->level, items, nq, m, next, P->d_counters,
                                                          P->thread_td.view());
       });
