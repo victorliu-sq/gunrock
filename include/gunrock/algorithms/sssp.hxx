@@ -38,9 +38,9 @@ namespace sssp {
 //    load and a compare-and-swap only when the distance improves;
 //  - every successful relaxation appends the vertex to the bin of its new
 //    distance (no deduplication, as GAP);
-//  - bin fusion (GACGE_SSSP_FUSE=0 off): a block, GAP's thread, relaxes its own
-//    current-bin vertices at once while fewer than 1000 (GAP's
-//    kBinSizeThreshold);
+//  - bin fusion (GACGE_SSSP_FUSE=<threshold>, 0 off, as sssp-cpu's): a block, GAP's
+//    thread, relaxes its own current-bin vertices at once while fewer than the
+//    threshold (default 1000, GAP's kBinSizeThreshold; at most 1000, the queue);
 //  - the next frontier is the current bin again if it is non-empty, else the
 //    lowest non-empty bin, taken whole (no copy).
 // A relaxation from bin b lands at most max weight / delta + 1 bins ahead, so
@@ -63,12 +63,17 @@ inline double sssp_delta_width() {
   }();
   return v;
 }
-inline bool sssp_fuse() {
-  static const bool v = [] {
+// the bin-fusion threshold, 0 when off
+inline int sssp_fuse_threshold() {
+  static const int v = [] {
     const char* e = std::getenv("GACGE_SSSP_FUSE");
-    return e == nullptr || std::atoi(e) != 0;
+    const int t = e ? std::atoi(e) : 1000;
+    return t < 0 ? 0 : t > 1000 ? 1000 : t;
   }();
   return v;
+}
+inline bool sssp_fuse() {
+  return sssp_fuse_threshold() > 0;
 }
 
 // GACGE_SSSP_FBUF: where a block keeps its bin-fusion queue and the vertices a
@@ -88,7 +93,7 @@ inline bool sssp_fbuf_global() {
 namespace delta {
 
 constexpr int kBlock = gacge::lb::kBlock;  // loops' launch box
-constexpr int kBinSizeThreshold = 1000;  // GAP's
+constexpr int kBinSizeThreshold = 1000;  // GAP's, the largest GACGE_SSSP_FUSE
 constexpr int kQueue = 1024;             // a block's current bin, >= the threshold
 constexpr int kSlots = 32;               // global fusion buffers per SM (> the 24 resident blocks of sm_89)
 constexpr int kMaxSm = 256;              // %smid bound for the global fusion buffers
@@ -108,6 +113,7 @@ struct step_t {
   uint8_t* marked;
   unsigned long long* work;  // relaxed edges, GACGE_TRAVERSAL_STATS only
   bool fuse;
+  int fuse_threshold;  // GACGE_SSSP_FUSE, <= kBinSizeThreshold
   vertex_t* fbuf;     // global fusion buffers (kMaxSm x kSlots x kFuseBuf), GACGE_SSSP_FBUF=global
   unsigned* fslots;   // per SM: the claimed slots of fbuf
   gacge::task::view_t task{};    // GACGE_TASK_STATS: per bin vertex
@@ -274,7 +280,7 @@ __global__ void __launch_bounds__(kBlock)
     const int m = queued;
     if (m == 0)
       break;
-    if (m >= kBinSizeThreshold) {  // left to the next step, as GAP's shared frontier
+    if (m >= p.fuse_threshold) {  // left to the next step, as GAP's shared frontier
       for (int i = t; i < min(m, kQueue); i += kBlock)
         append(p, p.R, sh.queue[i]);
       break;
@@ -396,7 +402,7 @@ struct problem_t : gunrock::problem_t<graph_t> {
   }
 
   delta::step_t<vertex_t, weight_t> step() {
-    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), fbuf, fslots,
+    return {this->result.distances, delta_w, bin, R, d_desc, marked, d_work, sssp_fuse(), sssp_fuse_threshold(), fbuf, fslots,
             task.view(), thread.view()};
   }
 
