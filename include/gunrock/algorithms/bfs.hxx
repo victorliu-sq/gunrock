@@ -51,6 +51,15 @@ namespace gap {
 
 constexpr int kBlock = gacge::lb::kBlock;
 constexpr int kAlpha = 15, kBeta = 18;  // GAP's defaults
+// GACGE_BFS_ALPHA / GACGE_BFS_BETA override them, as in bfs-cpu (src/gap/gapbs/src/bfs.cc)
+inline int alpha() {
+  static const int v = std::getenv("GACGE_BFS_ALPHA") ? std::atoi(std::getenv("GACGE_BFS_ALPHA")) : kAlpha;
+  return v;
+}
+inline int beta() {
+  static const int v = std::getenv("GACGE_BFS_BETA") ? std::atoi(std::getenv("GACGE_BFS_BETA")) : kBeta;
+  return v;
+}
 // Both steps' edges are spread by the load balancing GACGE_LB (gacge_lb.hxx:
 // thread, block or merge; the only GPU-specific choice of every GACGE
 // primitive). A bottom-up vertex stops at its first neighbor in the front, as
@@ -410,7 +419,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     auto stream = P->stream();
     const vertex_t n = G.get_number_of_vertices();
     const unsigned int blocks_n = (unsigned int)(((long long)n + gap::kBlock - 1) / gap::kBlock);
-    if (!P->pulling && P->scout > P->edges_to_check / gap::kAlpha) {
+    if (!P->pulling && P->scout > P->edges_to_check / gap::alpha()) {
       // QueueToBitmap(queue, front); awake_count = queue.size()
       const unsigned int qb = (unsigned int)((P->queue_n + gap::kBlock - 1) / gap::kBlock);
       gap::queue_to_bitmap_kernel<<<qb, gap::kBlock, 0, stream>>>(P->queue[P->cur], P->queue_n, P->front);
@@ -449,7 +458,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
       P->thread_bu.print("BFS", "thread-bottom-up", "level=" + std::to_string(P->level));
       P->task_bu.print("BFS", "bottom-up-step", "level=" + std::to_string(P->level));
       P->level++;
-      if (!(P->awake >= old_awake || P->awake > (long long)n / gap::kBeta)) {
+      if (!(P->awake >= old_awake || P->awake > (long long)n / gap::beta())) {
         // BitmapToQueue(g, front, queue); scout_count = 1
         P->clear_counters();
         gap::bitmap_to_queue_kernel<<<blocks_n, gap::kBlock, 0, stream>>>(P->front, n, P->queue[P->cur],
@@ -502,7 +511,7 @@ struct enactor_t : gunrock::enactor_t<problem_t> {
     }
     cudaStreamSynchronize(P->stream());
     auto G = P->get_graph();
-    const bool pull = P->pulling || P->scout > P->edges_to_check / gap::kAlpha;
+    const bool pull = P->pulling || P->scout > P->edges_to_check / gap::alpha();
     if (pull && P->pulling) {
       const uint32_t* bm = P->front;
       auto deg = [G, bm] __device__(vertex_t v) -> std::size_t {
