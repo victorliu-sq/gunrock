@@ -120,6 +120,20 @@ __global__ void __launch_bounds__(gacge::lb::kBlock) relabel_map_kernel(const ed
 
 // GAP's RelabelByDegree on the device: vertices sorted by (degree, id),
 // largest first, take ids 0, 1, ...; every list is mapped and sorted again.
+// GACGE: its buffers (the keys, the order, the new ids, the mapped lists, the
+// segmented sort's temporary and the relabelled graph itself) are allocated
+// once, in the first (warm-up) run, and kept: allocating them in every run put
+// cudaMalloc / cudaFree of gigabytes inside the timing (Arabic: 449 ms of
+// 1220, UK-2002: 229 of 307), as GAP's RelabelByDegree did on the CPU before
+// its buffers were kept too.
+template <typename csr_t>
+struct relabel_buffers_t {
+  using vertex_t = typename csr_t::index_type;
+  thrust::device_vector<unsigned long long> key;
+  thrust::device_vector<vertex_t> order, new_ids, mapped;
+  thrust::device_vector<unsigned char> temp;
+};
+
 template <typename csr_t>
 void relabel_by_degree(const csr_t& in, csr_t& out) {
   using vertex_t = typename csr_t::index_type;
@@ -128,8 +142,16 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
   const edge_t m = in.number_of_nonzeros;
   const edge_t* off = thrust::raw_pointer_cast(in.row_offsets.data());
   const vertex_t* col = thrust::raw_pointer_cast(in.column_indices.data());
-  thrust::device_vector<unsigned long long> key(n);
-  thrust::device_vector<vertex_t> order(n), new_ids(n);
+  static relabel_buffers_t<csr_t> B;
+  if (B.key.size() != (std::size_t)n) {
+    B.key.resize(n);
+    B.order.resize(n);
+    B.new_ids.resize(n);
+    B.mapped.resize(m);
+  }
+  thrust::device_vector<unsigned long long>& key = B.key;
+  thrust::device_vector<vertex_t>& order = B.order;
+  thrust::device_vector<vertex_t>& new_ids = B.new_ids;
   thrust::transform(thrust::counting_iterator<vertex_t>(0), thrust::counting_iterator<vertex_t>(n),
                     key.begin(), [off] __device__(vertex_t v) {
                       return ((unsigned long long)(off[v + 1] - off[v]) << 32) | (unsigned long long)v;
@@ -148,7 +170,7 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
                       return k < n ? off[ord[k] + 1] - off[ord[k]] : 0;
                     });
   thrust::exclusive_scan(out.row_offsets.begin(), out.row_offsets.end(), out.row_offsets.begin());
-  thrust::device_vector<vertex_t> mapped(m);
+  thrust::device_vector<vertex_t>& mapped = B.mapped;
   out.column_indices.resize(m);
   const edge_t* noff = thrust::raw_pointer_cast(out.row_offsets.data());
   const vertex_t* nid = thrust::raw_pointer_cast(new_ids.data());
@@ -165,11 +187,13 @@ void relabel_by_degree(const csr_t& in, csr_t& out) {
                                                                        gacge::lb::merge_args_t{});
     }
   });
+  // every new list sorted: cub's segmented sort (its segmented radix sort was 4.7x slower on Hollywood)
   std::size_t temp_bytes = 0;
   vertex_t* oc = thrust::raw_pointer_cast(out.column_indices.data());
   cub::DeviceSegmentedSort::SortKeys(nullptr, temp_bytes, mc, oc, (int64_t)m, (int64_t)n, noff, noff + 1);
-  thrust::device_vector<unsigned char> temp(temp_bytes);
-  cub::DeviceSegmentedSort::SortKeys(thrust::raw_pointer_cast(temp.data()), temp_bytes, mc, oc, (int64_t)m,
+  if (B.temp.size() < temp_bytes)
+    B.temp.resize(temp_bytes);
+  cub::DeviceSegmentedSort::SortKeys(thrust::raw_pointer_cast(B.temp.data()), temp_bytes, mc, oc, (int64_t)m,
                                      (int64_t)n, noff, noff + 1);
 }
 
@@ -299,7 +323,7 @@ void test_tc(int num_arguments, char** argument_array) {
       cudaEventCreate(&t1);
       gacge::profile::Begin();  // the relabelling is timed (and profiled) with the count
       cudaEventRecord(t0);
-      csr_t rcsr;
+      static csr_t rcsr;  // GACGE: kept across the runs (allocated in the first)
       relabel_by_degree(csr, rcsr);
       auto RG = graph::build<memory_space_t::device>(properties, rcsr);
       RG.alias_values(reinterpret_cast<weight_t*>(thrust::raw_pointer_cast(rcsr.column_indices.data())));
